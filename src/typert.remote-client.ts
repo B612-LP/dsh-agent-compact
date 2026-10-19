@@ -20,7 +20,7 @@ export const TYPERT_REMOTE = {
           codec: {
             mode: 'strict',
             typeSymbol: '@mimichunterz/agent-compact/ctx-surface#CtxSurfaceReadRequest',
-            // 0.2 的 TypertCodec（strict）由 `schema` 值改为 `create()` 惰性取 schema。
+            // strict codec 通过 create() 惰性物化 schema。
             create: () => request$schema,
           },
         },

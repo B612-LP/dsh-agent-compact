@@ -105,9 +105,8 @@ function kindOf(b: unknown): CtxSurfaceBlock['kind'] {
   }
 }
 
-// 只有 `user/message` 事件携带 `data.source`（见 MessageSourceMap：
-// user/plugin/model/tool/goal/session-reference）；其他行类型返回 undefined，
-// 完全不上线。
+// 只有 `user/message` 事件携带 `data.source`（kind 由生产者自行声明）；
+// 其他行类型返回 undefined，完全不上线。
 function sourceKindOf(n: SurfaceNodeLike): string | undefined {
   if (n.type !== 'user/message') return undefined
   const d = (n.data as SurfaceNodeData | undefined) ?? null

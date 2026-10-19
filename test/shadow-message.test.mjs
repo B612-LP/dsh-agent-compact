@@ -60,9 +60,8 @@ test('paired cleanup replacements remain valid user messages', () => {
   assert.doesNotThrow(() => session.deriveMessages().forEach((message) => {
     assert.equal(message.role, 'user')
     assert.equal(typeof message.id, 'string')
-    // 0.2 取消了通用的 `plugin` 来源；本插件声明并使用自己的 kind。
+    // 合成消息使用插件私有 kind，不会被误认成压缩检查点。
     assert.equal(message.source.kind, SHADOW_SOURCE_KIND)
-    assert.notEqual(message.source.kind, 'plugin')
     assert.equal(isCompactCheckpointSource(message.source), false)
   }))
 })

@@ -21,7 +21,7 @@ export const TYPERT = {
           codec: {
             mode: 'strict',
             typeSymbol: '@mimichunterz/agent-compact/ctx-surface#CtxSurfaceReadRequest',
-            // 0.2 的 TypertCodec（strict）由 `schema` 值改为 `create()` 惰性取 schema：
+            // strict codec 通过 create() 惰性物化 schema：
             // Gateway 的解码路径是 `codec.create().parse(value)`。
             create: () => request$schema,
           },

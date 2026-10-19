@@ -3,7 +3,7 @@
 //    （宿主页面通过 ClientModuleSystem 提供）；
 // 2. Cordis 接线层（$mount/slots.register/apply）保持为手写模板。
 // typert schema 块从 tsc 编译后的 lib/typert.remote-client.js 逐字提取；
-// zod 4.4.3 从官方 dsh-api-remotes bundle 中提取内联。
+// zod 由宿主 ClientModuleSystem 共享提供，bundle 通过 require("zod") 取得。
 // 修改后运行 `npm run build`（先 tsc 再本脚本）并刷新页面。
 import { readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -13,8 +13,8 @@ import * as esbuild from 'esbuild'
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 // ---- 0. 从 src/ctx-surface.ts 提取 wire schema 定义区段（源文件中注释必然
-// 保留；schema 定义是纯 JS 表达式，tsc 不改写其内容），并把 `z.foo(` 改写成
-// `foo(`（浏览器 bundle 的 zod 工厂是无前缀局部变量）----
+// 保留；schema 定义是纯 JS 表达式，tsc 不改写其内容），保留 `z.` 前缀：浏览器
+// bundle 的 `z` 来自宿主共享的 zod 模块（见下面的头部）----
 const ctxSurfacePath = join(root, 'src', 'ctx-surface.ts')
 const ctxSurfaceSrc = readFileSync(ctxSurfacePath, 'utf8')
 const schemaStart = ctxSurfaceSrc.indexOf('export const request$schema')
@@ -23,7 +23,6 @@ if (schemaStart < 0 || schemaEnd < 0 || schemaEnd <= schemaStart) throw new Erro
 const schemaBlock = ctxSurfaceSrc
 	.slice(schemaStart, schemaEnd)
 	.replace(/^export const /gm, 'const ')
-	.replace(/\bz\./g, '')
 	.replace(/\brequest\$schema\b/g, '_ctxSurface_read_request$schema')
 	.replace(/\bblock\$schema\b/g, '_ctxSurface_read_block$schema')
 	.replace(/\brow\$schema\b/g, '_ctxSurface_read_row$schema')
@@ -31,19 +30,7 @@ const schemaBlock = ctxSurfaceSrc
 	.trim()
 if (!schemaBlock.includes('_ctxSurface_read_result$schema')) throw new Error('schema extraction failed: result$schema rename missed')
 
-// ---- 1. 从 dsh-api-remotes 提取内联的 zod 4.4.3 区段 ----
-// 走 Node 包导出解析（而非某个人机器上的绝对路径）：只要 devDependencies 装好，
-// 在 `npm run build`、`prepare`（git 安装自建）、CI、任何开发者机器上都能定位到
-// 同一份文件，见 docs/user/develop/basic/publish.md 对 `prepare` 自包含性的要求。
-const apiRemotesPath = fileURLToPath(import.meta.resolve('@deepseek-ai/dsh-api-remotes/client'))
-const apiRemotes = readFileSync(apiRemotesPath, 'utf8').split('\n')
-const zodStart = apiRemotes.findIndex((l) => l.includes('//#region') && l.includes('zod/v4/core/core.js'))
-const schemasRegion = apiRemotes.findIndex((l) => l.includes('zod/v4/classic/schemas.js'))
-const zodEnd = apiRemotes.findIndex((l, i) => i > schemasRegion && l.trim() === '//#endregion')
-const zodCode = apiRemotes.slice(zodStart, zodEnd + 1).join('\n')
-if (!zodCode.includes('function readonly')) throw new Error('zod extraction failed: missing readonly factory')
-
-// ---- 2. 用 esbuild 构建 React 视图层（src/client/entry.tsx）----
+// ---- 1. 用 esbuild 构建 React 视图层（src/client/entry.tsx）----
 // react 保持 external：打包我们自己的 React 会创建第二个实例并破坏 hooks。
 const viewBuild = esbuild.buildSync({
 	entryPoints: [join(root, 'src/client/entry.tsx')],
@@ -59,16 +46,18 @@ const viewBuild = esbuild.buildSync({
 if (viewBuild.errors.length > 0) throw new Error('esbuild failed:\n' + viewBuild.errors.map((e) => e.text).join('\n'))
 const viewBundleCode = viewBuild.outputFiles[0].text
 
-// ---- 3. 头部 ----
+// ---- 2. 头部 ----
 const head = `window.__ModuleLoader__.load({
 	id: "@mimichunterz/agent-compact",
 	factory: (require) => {
 		var module = { exports: {} };
 		var exports = module.exports;
 		Object.defineProperty(exports, Symbol.toStringTag, { value: "Module" });
+		// 宿主共享的 zod 模块；schema 区段保留 \`z.\` 前缀。
+		const { z } = require("zod");
 `
 
-// ---- 4. 尾部：typert 描述符 + esbuild 视图 bundle + apply ----
+// ---- 3. 尾部：typert 描述符 + esbuild 视图 bundle + apply ----
 const tail = `
 		//#region ctx-surface wire schemas（自 lib/ctx-surface.js 提取）
 		${schemaBlock}
@@ -150,6 +139,6 @@ ${viewBundleCode}
 });
 `
 
-const bundle = head + zodCode + tail
+const bundle = head + tail
 writeFileSync(join(root, 'lib/client.js'), bundle)
 console.log('lib/client.js written,', bundle.length, 'bytes')

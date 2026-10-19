@@ -63,13 +63,8 @@ Pass through the inserted row in the profile's `cordis.patch.yml` or a bundle pa
 - **Anchor matching** (`src/normalize.ts`): `normText` collapses whitespace and maps CJK full-width punctuation to half-width (，→, etc.), applied to both anchors and node text. Matching keeps **unique-prefix** semantics: zero hits → "not found" with closest-node hints; more than one hit → "AMBIGUOUS".
 - **Restart-safe sequential archives**: the next number is derived by scanning the session's spill directory (`max+1`) — gap-free; the backend's random hex prefix makes filename collisions impossible.
 - **Paired cleanup**: the tool-call message (carrying the full `summary` argument) and its tool/result are each replaced by one tiny shadow message, so the checkpoint text never appears twice on the surface (skipped when the message holds more than one tool call).
-
-## Compatibility
-
-- Built and verified against DeepSeek Harness `0.2.0-rc.2` (`@deepseek-ai/dsh-compaction-basic@0.2.0-rc.2`, cordis `4.0.4`, schemastery `3.18.4`).
-- 0.2 migration notes: `MessageSourceMap` dropped the shared `plugin` kind, so shadow messages now declare the plugin-owned `agent-compact` source; `SurfaceOp` replace uses `startSeq`/`endSeq` (was `start`/`end`); strict `TypertCodec` takes `create()` instead of a prebuilt `schema`; `JsonValue` moved from `dsh-tools`/`dsh-session` to `@deepseek-ai/dsh-util-values`; `dsh.client.inject` lists Client **packages** (it previously held service names).
-- Only **one compaction per session at a time** (the engine transaction is serialized); anchors re-resolve on every call, so later compactions never go stale after earlier checkpoints replaced old nodes.
-- With a local spill backend the root is fixed; other backends degrade gracefully (no `root` field → in-memory counter), and compaction itself is unaffected.
+- **Serialized compaction**: only one compaction runs per session at a time (the engine transaction is serialized); anchors re-resolve on every call, so later compactions never go stale after earlier checkpoints replaced old nodes.
+- **Spill backend fallback**: with a local spill backend the root is fixed; other backends degrade gracefully (no `root` field → in-memory counter), and compaction itself is unaffected.
 
 ## License
 

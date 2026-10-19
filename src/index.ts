@@ -6,7 +6,7 @@ import { createHash } from 'node:crypto'
 import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { defineTool } from '@deepseek-ai/dsh-tools'
-// 0.2 起 `JsonValue` 从 dsh-tools / dsh-session 移到 dsh-util-values。
+// `JsonValue` 由 dsh-util-values 提供（不在 dsh-tools / dsh-session）。
 import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import Schema from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'

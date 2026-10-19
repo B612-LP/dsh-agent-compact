@@ -63,13 +63,8 @@ dsh plugin --profile web remove @mimichunterz/agent-compact
 - **锚点定位**(`src/normalize.ts`):`normText` 折叠空白并把 CJK 全角标点映射为半角(，→, 等),锚点与节点文本共用同一函数;仍保持**唯一前缀**语义(0 命中 → not found + 最近节点提示;多命中 → AMBIGUOUS)。
 - **重启安全的顺序归档**:fs 扫描会话目录取 `max+1` 顺序递增,无空洞;后端自带随机 hex 前缀,文件名永不冲突。
 - **配对清理**:携带完整 `summary` 参数的工具调用消息节点 + tool/result 各被替换成一条极小的 shadow 消息,避免检查点文本在表面出现两份(同一消息含多个工具调用时安全跳过)。
-
-## 兼容性
-
-- 针对 DeepSeek Harness `0.2.0-rc.2`(`@deepseek-ai/dsh-compaction-basic@0.2.0-rc.2`,cordis `4.0.4`,schemastery `3.18.4`)构建与验证。
-- 0.2 迁移要点:`MessageSourceMap` 取消了通用的 `plugin` 来源,shadow 消息改为声明插件私有的 `agent-compact`;`SurfaceOp` replace 改用 `startSeq`/`endSeq`(原为 `start`/`end`);strict `TypertCodec` 由 `schema` 值改为 `create()`;`JsonValue` 从 `dsh-tools`/`dsh-session` 移到 `@deepseek-ai/dsh-util-values`;`dsh.client.inject` 填的是客户端**包名**(原先误填服务名)。
-- 每个会话**同一时刻只允许一次压缩**(引擎事务串行);锚点每次重新解析,重复压缩不会因之前的检查点而过期。
-- 本地 spill 后端固定 root;换用其他后端时归档功能按可用性降级(无 `root` 字段则回退内存计数),压缩本身不受影响。
+- **压缩串行化**:每个会话同一时刻只允许一次压缩(引擎事务串行);锚点每次重新解析,重复压缩不会因之前的检查点而过期。
+- **spill 后端降级**:本地 spill 后端固定 root;换用其他后端时按可用性降级(无 `root` 字段则回退内存计数),压缩本身不受影响。
 
 ## License
 
