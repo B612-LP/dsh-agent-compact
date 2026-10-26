@@ -27,8 +27,8 @@ export interface Config {
 }
 
 export const Config: Schema<Config> = Schema.object({
-  autoArchive: Schema.boolean().default(true).description('context_compact saves the full raw span to a spill artifact before replacing it.'),
-  volumeNudgeTokens: Schema.number().default(50000).description('Every time accumulated tool-result output (heuristic token count) since the last compaction crosses another multiple of this amount, remind the model to consider context_compact. Set to 0 to disable.'),
+  autoArchive: Schema.boolean().default(true).description('context_compact 压缩前先把被压原文完整存一份到 spill 留底文件。'),
+  volumeNudgeTokens: Schema.number().default(50000).description('自上次压缩起，累计增长的 token 每跨过这个数的整数倍，就提醒模型考虑用 context_compact 压缩。设为 0 关闭提醒。'),
 })
 
 export function apply(ctx: Context, config: Config) {
@@ -243,7 +243,7 @@ export function apply(ctx: Context, config: Config) {
     disposers.push(systemPrompt.section({
       name: 'tool:context_compact',
       order: 118,
-      text: 'Use the context_compact tool to proactively externalize conversation spans that have served their purpose, the way a smart human memory keeps what matters and lets go of the rest — routine memory hygiene, not a last resort. Compress only a span whose information a summary fully covers for the rest of the conversation; if verbatim detail may still be needed, leave it. The tool replaces only the span you select: compress in segments by sub-task/module: when a single sub-task has consumed a big share of the surface and reaches a conclusion, compact that module\'s span in chunks before moving on — never accumulate separate dead spans into one giant compression. Compress large outputs (log queries, big file reads) as soon as they are read and digested. Evaluate whenever a span has been used up, not only at topic boundaries, and never compress the opening, the in-flight task, or the active instruction; preserve exact paths, commands, IDs, and the user\'s requirements in the checkpoint.',
+      text: '使用 context_compact 工具主动外置已完成使命的对话段落——像聪明的人类记忆那样留存要事、放下其余，这是常规记忆整理而非最后手段。只压缩「其信息能被摘要完整覆盖后续对话」的段落；若逐字细节后续可能还要用，就留着。工具只替换你选定的段落：按子任务/模块分段压缩——某个子任务占用大量上下文并已收尾时，先把该模块的段落分块压缩掉再继续，绝不把多个失效段落攒成一次巨型压缩。大体积输出（日志查询、大文件读取）一经读毕消化就尽快压缩。段落何时算「用完」要随时评估，不要只等话题边界；开头、进行中的任务、当前指令永不压缩；检查点里保留确切的路径、命令、ID 和用户要求。',
     }))
   }
 
@@ -282,7 +282,7 @@ export function apply(ctx: Context, config: Config) {
           const bucket = Math.floor(grown / threshold)
           if (bucket <= 0) return ''
           const approxK = Math.round((bucket * threshold) / 1000)
-          return '`context_compact` reminder: this session\'s surface has grown by roughly ' + approxK + 'k+ tokens since the last compaction (tool results AND your own reasoning/output both count). Compress by sub-task module, not all at once: when one sub-task\'s span (its tool results + your reasoning/output) has consumed a large share of the surface and that sub-task has reached a conclusion, compact that module\'s span in chunks now with `context_compact` — do not wait to be asked.'
+          return '`context_compact` 提醒：自上次压缩以来，本会话上下文已增长约 ' + approxK + 'k+ token（工具结果和你自己的推理/输出都算）。按子任务模块分段压缩，不要一次全压：当某个子任务的段落（其工具结果＋你的推理/输出）占了大量上下文且该子任务已收尾时，现在就用 `context_compact` 分块压缩该模块——不要等用户开口。'
         } catch (e) {
           return ''
         }
@@ -292,11 +292,11 @@ export function apply(ctx: Context, config: Config) {
 
   disposers.push(tools.register(defineTool({
     name: 'context_compact',
-    description: 'Compress a past conversation span into one Markdown checkpoint you write; the raw span is archived to a spill artifact, the compaction recorded. Anchor matching: anchors match the opening text of a message body (user/assistant messages only; tool-call blocks, tool results, and other transcript structure excluded). Whitespace, tool-call markers, and full/half-width punctuation differences are ignored; each anchor must match exactly one user or assistant message. When to compact: ① Progress — compact each finished step at its topic boundary, keeping the active instruction and remaining steps live; ② Course correction — compact the failed span into a checkpoint recording what went wrong and the corrected direction, instead of carrying noise forward; ③ Rebaseline — stale opening requirements: compact the start too, restating current intent and what survives. Checkpoint: Markdown, terse bullets, ## sections; keep exact paths/commands/IDs and the user\'s requirements and direction. Per scene — Progress: Primary Request and Intent / Key Technical Concepts / Files and Code / Errors and Fixes / Current Work / Next Step; Correction: what went wrong / root cause / fix / next; Rebaseline: current intent / surviving decisions / plan ahead. Constraints: one compaction per session at a time; checkpoint must be smaller than the compressed span; edges snap to balanced tool-call/result boundaries.',
+    description: '把过去一段对话压缩成一份由你撰写的 Markdown 检查点；被压缩的原文归档为 spill 留底文件，并记录这次压缩。锚点匹配：锚点匹配消息正文的开头文本（仅限 user/assistant 消息；工具调用块、工具结果等转录结构除外）。空白、工具调用标记、全角/半角标点差异均被忽略；每个锚点必须恰好匹配一条 user 或 assistant 消息。何时压缩：① 进展——每个完成的步骤在其话题边界压缩，保持活动指令和剩余步骤在线；② 纠偏——把失败的段落压缩成检查点，记录错在哪、修正后的方向，而不是把噪音继续背着走；③ 重定基——开头要求已过时：连开头一起压缩，重申当前意图与仍然有效的决定。检查点写法：Markdown、精炼要点、## 分节；保留确切路径/命令/ID 与用户的要求和方向。分场景结构——进展：主要请求与意图 / 关键技术概念 / 文件与代码 / 错误与修复 / 当前工作 / 下一步；纠偏：错在哪 / 根因 / 修复 / 下一步；重定基：当前意图 / 仍然有效的决定 / 后续计划。约束：同一时刻只允许一个压缩进行；检查点必须小于被压缩的段落；边界自动对齐到成对的工具调用/结果处。',
     parameters: {
-      startAnchor: { type: 'string', description: 'Verbatim opening of the span\'s first message. Required for a middle span; omitting starts at the conversation\'s first message, discarding opening requirements and direction — only for compressing all history up to endAnchor or rebaselining.' },
-      endAnchor: { type: 'string', description: 'Verbatim opening of the span\'s last message; required. This node is replaced — pass its predecessor\'s opening to keep it.' },
-      summary: { type: 'string', description: 'Required. The full Markdown checkpoint replacing the span, written by you from the conversation; never verbatim. Per-scene structure as in the description; must be smaller than the compressed content.' },
+      startAnchor: { type: 'string', description: '段落第一条消息正文的逐字开头。压缩中间段落时必填；省略则从对话第一条消息开始——开头的要求与方向会被丢弃，仅用于把全部历史压到 endAnchor，或重定基。' },
+      endAnchor: { type: 'string', description: '段落最后一条消息的逐字开头；必填。该节点本身会被替换——想保留它，就传它前一条消息的开头。' },
+      summary: { type: 'string', description: '必填。替换该段落的完整 Markdown 检查点，由你根据对话撰写；禁止逐字照抄。分场景结构见工具描述；必须小于被压缩的内容。' },
     },
     output: {
       // 显式声明真实字段（而非开放的 additionalProperties:true 空对象），
@@ -305,7 +305,7 @@ export function apply(ctx: Context, config: Config) {
         type: 'object',
         additionalProperties: false,
         properties: {
-          ok: { type: 'boolean', required: true, description: 'Always true on a successful call (a failure throws instead).' },
+          ok: { type: 'boolean', required: true, description: '调用成功时恒为 true（失败会直接抛错而不是返回 false）。' },
           archived: {
             required: true,
             oneOf: [
@@ -314,14 +314,14 @@ export function apply(ctx: Context, config: Config) {
                 type: 'object',
                 additionalProperties: false,
                 properties: {
-                  locator: { type: 'json', required: true, description: 'Opaque spill-store locator for the archived raw span.' },
-                  retrievalHint: { type: 'json', required: true, description: 'Backend-specific hint for retrieving the archived span.' },
+                  locator: { type: 'json', required: true, description: '归档原文的 spill 留底库定位符（不透明字符串）。' },
+                  retrievalHint: { type: 'json', required: true, description: '后端相关的留底取回提示。' },
                 },
               },
             ],
-            description: 'Archive record when the raw span was saved, or null when it was not.',
+            description: '原文已留底时为归档记录，未留底时为 null。',
           },
-          archiveError: { type: 'string', description: 'Present only when autoArchive was requested but archiving failed; compaction still succeeded.' },
+          archiveError: { type: 'string', description: '仅当请求了自动留底但留底失败时出现；此时压缩本身仍然成功。' },
         },
       },
       render(args, value) { return [{ type: 'text', text: JSON.stringify(value) }] },
@@ -402,18 +402,18 @@ export function apply(ctx: Context, config: Config) {
                   // 把归档定位符写进完成消息（承载它的 tool/result 随后被 shadow）。
                   const locText = archived && archived.locator ? String(archived.locator) : ''
                   const freedText = result.shadowedTokenCount !== undefined && result.shadowedTokenCount !== null
-                    ? '; freed ~' + String(result.shadowedTokenCount) + ' tokens'
+                    ? '；释放约 ' + String(result.shadowedTokenCount) + ' token'
                     : ''
-                  const doneText = '`context_compact` done: checkpoint above' + freedText + (locText
-                    ? '; raw span archived at ' + locText + '.'
-                    : '; raw span not archived.')
+                  const doneText = '`context_compact` 完成：检查点已写入上方' + freedText + (locText
+                    ? '；原文留底：' + locText + '。'
+                    : '；原文未留底。')
                   session.append('user/message', createShadowUserMessage(doneText), {
                     surfaceOp: { op: 'replace', startSeq: assistantSeq, endSeq: assistantSeq },
                     sourceEventSeqs: [assistantSeq],
                   })
                   // 复用该占位槽位作为自我触发的习惯提醒：每次成功调用都给
                   // 下一次留下提示，引导模型自主管理上下文。
-                  session.append('user/message', createShadowUserMessage('`context_compact` result shadowed. Keep managing context this way on your own: once the next sub-task finishes, an error gets resolved, or a large tool result has been fully digested, compact that span before it goes stale — do not wait to be asked again.'), {
+                  session.append('user/message', createShadowUserMessage('`context_compact` 的结果已并入上方检查点。继续保持自主管理上下文：下一个子任务收尾、一个错误被解决、或某条大工具结果被消化完毕时，就及时压缩对应段落——不必等用户再提。'), {
                     surfaceOp: { op: 'replace', startSeq: resultSeq, endSeq: resultSeq },
                     sourceEventSeqs: [resultSeq],
                   })
