@@ -28,7 +28,7 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   autoArchive: Schema.boolean().default(true).description('context_compact saves the full raw span to a spill artifact before replacing it.'),
-  volumeNudgeTokens: Schema.number().default(50000).description('Every time accumulated tool-result output (heuristic token count) since the last compaction crosses another multiple of this amount, remind the model to consider context_compact. Set to 0 to disable.'),
+  volumeNudgeTokens: Schema.number().default(100000).description('Every time accumulated tool-result output (heuristic token count) since the last compaction crosses another multiple of this amount, remind the model to consider context_compact. Set to 0 to disable.'),
 })
 
 export function apply(ctx: Context, config: Config) {
@@ -243,7 +243,7 @@ export function apply(ctx: Context, config: Config) {
     disposers.push(systemPrompt.section({
       name: 'tool:context_compact',
       order: 118,
-      text: 'Use the context_compact tool to proactively externalize conversation spans that have served their purpose, the way a smart human memory keeps what matters and lets go of the rest — routine memory hygiene, not a last resort. Compress only a span whose information a summary fully covers for the rest of the conversation; if verbatim detail may still be needed, leave it. The tool replaces only the span you select: compress in segments by sub-task/module: when a single sub-task has consumed a big share of the surface and reaches a conclusion, compact that module\'s span in chunks before moving on — never accumulate separate dead spans into one giant compression. Compress large outputs (log queries, big file reads) as soon as they are read and digested. Evaluate whenever a span has been used up, not only at topic boundaries, and never compress the opening, the in-flight task, or the active instruction; preserve exact paths, commands, IDs, and the user\'s requirements in the checkpoint.',
+      text: 'Use the context_compact tool to externalize conversation spans that have fully served their purpose — routine memory hygiene, but bias toward keeping context: a wrong compression costs more working quality than the tokens it saves. Compress only a span that satisfies ALL of: (a) its sub-task is fully concluded; (b) a summary fully covers its information for the rest of the conversation; (c) it is not part of a high-risk operation still in progress (deploys, migrations, long-running jobs) — never compress those until they finish. Keep each compression to ONE concluded sub-task; a large multi-milestone effort is compressed per milestone, never as one giant span. If verbatim detail may still be quoted later (error text, file contents, exact numbers), leave the span. Never compress the opening, the in-flight task, or the active instruction; preserve exact paths, commands, IDs, the user\'s requirements, and every user correction verbatim in the checkpoint.',
     }))
   }
 
@@ -282,7 +282,7 @@ export function apply(ctx: Context, config: Config) {
           const bucket = Math.floor(grown / threshold)
           if (bucket <= 0) return ''
           const approxK = Math.round((bucket * threshold) / 1000)
-          return '`context_compact` reminder: this session\'s surface has grown by roughly ' + approxK + 'k+ tokens since the last compaction (tool results AND your own reasoning/output both count). Compress by sub-task module, not all at once: when one sub-task\'s span (its tool results + your reasoning/output) has consumed a large share of the surface and that sub-task has reached a conclusion, compact that module\'s span in chunks now with `context_compact` — do not wait to be asked.'
+          return '`context_compact` reminder: this session\'s surface has grown by roughly ' + approxK + 'k+ tokens since the last compaction (tool results AND your own reasoning/output both count). If a fully concluded sub-task\'s span (its tool results + your reasoning/output) has consumed a large share of the surface, consider compacting that module\'s span in chunks with `context_compact`; skip it while anything is still in flight or its verbatim detail may still be needed.'
         } catch (e) {
           return ''
         }
@@ -413,7 +413,7 @@ export function apply(ctx: Context, config: Config) {
                   })
                   // 复用该占位槽位作为自我触发的习惯提醒：每次成功调用都给
                   // 下一次留下提示，引导模型自主管理上下文。
-                  session.append('user/message', createShadowUserMessage('`context_compact` result shadowed. Keep managing context this way on your own: once the next sub-task finishes, an error gets resolved, or a large tool result has been fully digested, compact that span before it goes stale — do not wait to be asked again.'), {
+                  session.append('user/message', createShadowUserMessage('`context_compact` result shadowed. Stay conservative: compact only fully concluded sub-task spans, never anything in flight; when in doubt, keep the context as is.'), {
                     surfaceOp: { op: 'replace', startSeq: resultSeq, endSeq: resultSeq },
                     sourceEventSeqs: [resultSeq],
                   })
