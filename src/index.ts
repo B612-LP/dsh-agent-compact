@@ -28,7 +28,7 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   autoArchive: Schema.boolean().default(true).description('context_compact saves the full raw span to a spill artifact before replacing it.'),
-  volumeNudgeTokens: Schema.number().default(100000).description('Every time accumulated tool-result output (heuristic token count) since the last compaction crosses another multiple of this amount, remind the model to consider context_compact. Set to 0 to disable.'),
+  volumeNudgeTokens: Schema.number().default(200000).description('Every time accumulated tool-result output (heuristic token count) since the last compaction crosses another multiple of this amount, remind the model to consider context_compact. Set to 0 to disable.'),
 })
 
 export function apply(ctx: Context, config: Config) {
@@ -243,7 +243,7 @@ export function apply(ctx: Context, config: Config) {
     disposers.push(systemPrompt.section({
       name: 'tool:context_compact',
       order: 118,
-      text: 'Use the context_compact tool to externalize conversation spans that have fully served their purpose — routine memory hygiene, but bias toward keeping context: a wrong compression costs more working quality than the tokens it saves. Compress only a span that satisfies ALL of: (a) its sub-task is fully concluded; (b) a summary fully covers its information for the rest of the conversation; (c) it is not part of a high-risk operation still in progress (deploys, migrations, long-running jobs) — never compress those until they finish. Keep each compression to ONE concluded sub-task; a large multi-milestone effort is compressed per milestone, never as one giant span. If verbatim detail may still be quoted later (error text, file contents, exact numbers), leave the span. Never compress the opening, the in-flight task, or the active instruction; preserve exact paths, commands, IDs, the user\'s requirements, and every user correction verbatim in the checkpoint.',
+      text: 'Use the context_compact tool to externalize conversation spans that have fully served their purpose — but do not compress proactively between volume nudges: evaluate only when a nudge appears or the user asks. A wrong compression costs more working quality than the tokens it saves. Compress only a span that satisfies ALL of: (a) its sub-task is fully concluded; (b) a summary fully covers its information for the rest of the conversation; (c) it is not part of a high-risk operation still in progress (deploys, migrations, long-running jobs) — never compress those until they finish. Keep each compression to ONE concluded sub-task; a large multi-milestone effort is compressed per milestone, never as one giant span. If verbatim detail may still be quoted later (error text, file contents, exact numbers), leave the span. Never compress the opening, the in-flight task, or the active instruction; preserve exact paths, commands, IDs, the user\'s requirements, and every user correction verbatim in the checkpoint.',
     }))
   }
 
