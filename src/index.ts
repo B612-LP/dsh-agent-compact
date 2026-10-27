@@ -285,7 +285,7 @@ export function apply(ctx: Context, config: Config) {
           // 阶梯提醒（随阈值缩放）：5/6 处一次性、1× 处一次性、4/3 起持续。
           // 默认 30 万 → 25 万一次、30 万一次、40 万起每轮都在。
           const build = (approxK: number, recurring: boolean) =>
-            '`context_compact` reminder: this session\'s surface has grown by roughly ' + approxK + 'k+ tokens since the last compaction (tool results AND your own reasoning/output both count).' + (recurring ? ' This reminder repeats every turn until a compaction resets it.' : ' One-time nudge.') + ' If a fully concluded sub-task\'s span (its tool results + your reasoning/output) has consumed a large share of the surface, consider compacting that module\'s span in chunks with `context_compact`; skip it while anything is still in flight or its verbatim detail may still be needed.'
+            '`context_compact` reminder: this session\'s surface has grown by roughly ' + approxK + 'k+ tokens since the last compaction (tool results AND your own reasoning/output both count).' + (recurring ? ' This reminder repeats every turn until a compaction resets it.' : ' One-time nudge.') + ' A nudge is a trigger to evaluate, never an instruction to compact: compact only at the right place — a fully concluded sub-task\'s span, compressed in chunks with `context_compact`; skip it while anything is still in flight or its verbatim detail may still be needed.'
           const persistentFrom = Math.floor((threshold * 4) / 3)
           if (grown >= persistentFrom) {
             return build(Math.round(grown / 1000), true)
