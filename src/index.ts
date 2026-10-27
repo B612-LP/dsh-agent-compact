@@ -28,7 +28,7 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   autoArchive: Schema.boolean().default(true).description('context_compact saves the full raw span to a spill artifact before replacing it.'),
-  volumeNudgeTokens: Schema.number().default(300000).description('Every time accumulated tool-result output (heuristic token count) since the last compaction crosses another multiple of this amount, remind the model to consider context_compact. Set to 0 to disable.'),
+  volumeNudgeTokens: Schema.number().default(300000).description('Nudge ladder over growth (heuristic token count, tool results AND model output) since the last compaction: one-time nudges at 5/6× and 1× of this amount, then a persistent every-turn reminder from 4/3× onward until a compaction resets the baseline. Example 300000: one-time at 250k and 300k, persistent from 400k. Set to 0 to disable.'),
 })
 
 export function apply(ctx: Context, config: Config) {
@@ -95,6 +95,8 @@ export function apply(ctx: Context, config: Config) {
   //  2. tokenMeter 的 surfaceTokens（chars/4 启发式），仅当 (1) 不可用时使用。
   // 两者均按会话增量累积，服务缺席时整个特性降级为 no-op。
   const volumeBaseline = new WeakMap<SessionLike, number>()
+  // 已触发过的一次性提醒档位（每会话）；压缩重置基线时一并清空。
+  const firedOneShots = new WeakMap<SessionLike, Set<number>>()
 
   interface TokenMeterLike {
     measure(session: SessionLike): { surfaceTokens?: number } | null | undefined
@@ -253,6 +255,7 @@ export function apply(ctx: Context, config: Config) {
       if (!session || event.type !== 'compaction/summary') return
       const tokens = occupancyTokensOf(session)
       volumeBaseline.set(session, tokens ?? 0)
+      firedOneShots.delete(session)
     } catch (e) {
       /* 忽略 */
     }
@@ -279,10 +282,23 @@ export function apply(ctx: Context, config: Config) {
           const baseline = volumeBaseline.get(agent.session) ?? 0
           const grown = now - baseline
           if (grown <= 0) return ''
-          const bucket = Math.floor(grown / threshold)
-          if (bucket <= 0) return ''
-          const approxK = Math.round((bucket * threshold) / 1000)
-          return '`context_compact` reminder: this session\'s surface has grown by roughly ' + approxK + 'k+ tokens since the last compaction (tool results AND your own reasoning/output both count). If a fully concluded sub-task\'s span (its tool results + your reasoning/output) has consumed a large share of the surface, consider compacting that module\'s span in chunks with `context_compact`; skip it while anything is still in flight or its verbatim detail may still be needed.'
+          // 阶梯提醒（随阈值缩放）：5/6 处一次性、1× 处一次性、4/3 起持续。
+          // 默认 30 万 → 25 万一次、30 万一次、40 万起每轮都在。
+          const build = (approxK: number, recurring: boolean) =>
+            '`context_compact` reminder: this session\'s surface has grown by roughly ' + approxK + 'k+ tokens since the last compaction (tool results AND your own reasoning/output both count).' + (recurring ? ' This reminder repeats every turn until a compaction resets it.' : ' One-time nudge.') + ' If a fully concluded sub-task\'s span (its tool results + your reasoning/output) has consumed a large share of the surface, consider compacting that module\'s span in chunks with `context_compact`; skip it while anything is still in flight or its verbatim detail may still be needed.'
+          const persistentFrom = Math.floor((threshold * 4) / 3)
+          if (grown >= persistentFrom) {
+            return build(Math.round(grown / 1000), true)
+          }
+          const fired = firedOneShots.get(agent.session) ?? new Set<number>()
+          for (const tier of [Math.floor((threshold * 5) / 6), threshold]) {
+            if (grown >= tier && !fired.has(tier)) {
+              fired.add(tier)
+              firedOneShots.set(agent.session, fired)
+              return build(Math.round(tier / 1000), false)
+            }
+          }
+          return ''
         } catch (e) {
           return ''
         }
