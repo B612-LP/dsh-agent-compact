@@ -15,6 +15,7 @@ import { patchEngine } from './optimizer.js'
 import { normText } from './normalize.js'
 import { CtxSurfaceService } from './ctx-surface.js'
 import { resolveBoundaries, soleToolCall, spanText } from './boundary.js'
+import { occupancyFromMeasurement, pressureRowFieldsOf, projectedPressureFromRow } from './occupancy.js'
 import type { AgentLike, OptimizedEngineLike, SessionLike, SurfaceNode } from './optimizer.js'
 
 export const name = 'tool-context-compression'
@@ -28,7 +29,7 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.object({
   autoArchive: Schema.boolean().default(true).description('context_compact saves the full raw span to a spill artifact before replacing it.'),
-  volumeNudgeTokens: Schema.number().default(300000).description('Nudge ladder over growth (heuristic token count, tool results AND model output) since the last compaction: one-time nudges at 5/6× and 1× of this amount, then a persistent every-turn reminder from 4/3× onward until a compaction resets the baseline. Example 300000: one-time at 250k and 300k, persistent from 400k. Set to 0 to disable.'),
+  volumeNudgeTokens: Schema.number().default(300000).description('Nudge ladder over growth in request pressure since the last compaction, measured provider-usage-anchored when available (falls back to the heuristic surface estimate): one-time nudges at 5/6× and 1× of this amount, then a persistent every-turn reminder from 4/3× onward until a compaction resets the baseline. Example 300000: one-time at 250k and 300k, persistent from 400k. Set to 0 to disable.'),
 })
 
 export function apply(ctx: Context, config: Config) {
@@ -87,32 +88,36 @@ export function apply(ctx: Context, config: Config) {
     sourceEventSeqs?: unknown
   }
 
-  // 用会话占用量的增长量作为提醒信号：自上次压缩以来增长每跨过
-  // config.volumeNudgeTokens 的一个整数倍，就提示模型考虑压缩。
-  // 度量指标按优先级：
-  //  1. sessionProjections 的 contextPressure.projectedTokens（provider 真实
-  //     usage 的投影，每次 LLM 调用都会重新同步到真实值）；
-  //  2. tokenMeter 的 surfaceTokens（chars/4 启发式），仅当 (1) 不可用时使用。
-  // 两者均按会话增量累积，服务缺席时整个特性降级为 no-op。
+  // 用会话占用量的增长量作为提醒信号：自上次压缩以来增长跨过
+  // config.volumeNudgeTokens 的 5/6、1 倍档各提醒一次，4/3 倍起每轮持续提醒。
+  // 度量指标按优先级（按 provider 锚定程度排序）：
+  //  1. tokenMeter.measure().totalTokens —— 官方服务以最近一次成功调用的
+  //     provider 真实 usage 为锚、对表面增量重定价后的当前请求压力；CJK 与
+  //     JSON 不会被 chars/4 启发式低估；
+  //  2. tokenMeter.measure().surfaceTokens —— 同一次测量的启发式表面值；
+  //  3. sessionProjections 的 contextPressure 行 —— 兼容 { ver, seq, val }
+  //     包装，按官方 view() 公式现算（pressureTokens + surface −
+  //     sampledSurface），无采样锚时退回 pressureTokens；仅当 tokenMeter
+  //     服务缺席时使用。
+  // 全部缺席时整个特性降级为 no-op。
   const volumeBaseline = new WeakMap<SessionLike, number>()
   // 已触发过的一次性提醒档位（每会话）；压缩重置基线时一并清空。
   const firedOneShots = new WeakMap<SessionLike, Set<number>>()
 
   interface TokenMeterLike {
-    measure(session: SessionLike): { surfaceTokens?: number } | null | undefined
+    measure(session: SessionLike): { surfaceTokens?: unknown; totalTokens?: unknown } | null | undefined
   }
 
   interface SessionProjectionsLike {
     snapshot(session: SessionLike): { values?: Record<string, unknown> } | null | undefined
   }
 
-  function surfaceTokensOf(session: SessionLike): number | null {
+  function tokenMeterMeasureOf(session: SessionLike): { surfaceTokens?: unknown; totalTokens?: unknown } | null {
     const meter = ctx.get('tokenMeter') as TokenMeterLike | undefined
     if (!meter || typeof meter.measure !== 'function') return null
     try {
-      const m = meter.measure(session)
-      const tokens = m && typeof m.surfaceTokens === 'number' ? m.surfaceTokens : null
-      return tokens
+      const m = meter.measure(session) as { surfaceTokens?: unknown; totalTokens?: unknown } | null | undefined
+      return m && typeof m === 'object' ? m : null
     } catch (e) {
       return null
     }
@@ -124,18 +129,17 @@ export function apply(ctx: Context, config: Config) {
     try {
       const snap = projections.snapshot(session)
       const values = snap && snap.values
-      const contextPressure = values ? (values as { contextPressure?: { projectedTokens?: unknown } }).contextPressure : undefined
-      const projected = contextPressure && typeof contextPressure.projectedTokens === 'number' ? contextPressure.projectedTokens : null
-      return projected
+      if (!values || typeof values !== 'object') return null
+      return projectedPressureFromRow(pressureRowFieldsOf((values as Record<string, unknown>).contextPressure))
     } catch (e) {
       return null
     }
   }
 
   function occupancyTokensOf(session: SessionLike): number | null {
-    const projected = contextPressureProjectedTokensOf(session)
-    if (projected !== null) return projected
-    return surfaceTokensOf(session)
+    const fromMeter = occupancyFromMeasurement(tokenMeterMeasureOf(session))
+    if (fromMeter !== null) return fromMeter
+    return contextPressureProjectedTokensOf(session)
   }
 
   function resolveService(agent: AgentLike, serviceName: string): unknown {
