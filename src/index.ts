@@ -13,8 +13,10 @@ import type { Context } from '@deepseek-ai/cordis'
 import { createShadowUserMessage } from './shadow-message.js'
 import { runWithExternalSummary } from './optimizer.js'
 import { toolPairingBalancedBefore, toolPairingBalancedAfter } from '@deepseek-ai/dsh-compaction'
-import { CompactionPlans, inspectSurface, seqRegion, fingerprint, selectionPrices, sourcePrice, benefit, pureCompactionCall, activeCallPosition, MIN_SOURCE_TOKENS, MIN_NET_SAVINGS_TOKENS } from './preflight.js'
+import { CompactionPlans, inspectSurface, seqRegion, fingerprint, selectionPrices, sourcePrice, compactionBenefit, checkpointMessage, pureCompactionCall, activeCallPosition, MIN_SOURCE_TOKENS, MIN_NET_SAVINGS_TOKENS } from './preflight.js'
 import type { Region, Meter } from './preflight.js'
+import { discoverSurface } from './discovery.js'
+import type { DiscoveryOptions } from './discovery.js'
 import { normText } from './normalize.js'
 import { CtxSurfaceService } from './ctx-surface.js'
 import { resolveBoundaries, soleToolCall, spanText } from './boundary.js'
@@ -199,22 +201,25 @@ export function apply(ctx: Context, config: Config) {
   const disposers: (() => void)[] = []
   const plans = new CompactionPlans()
   const compacting = new Set<string>()
+  const receipts = new WeakMap<object, Map<string, { until: number; value: any }>>()
 
   disposers.push(registerProactiveCompaction(ctx, config))
 
   disposers.push(tools.register(defineTool({
     name: 'context_compact',
-    description: 'Safely checkpoint ONE substantial, fully concluded sub-task, preserving exact requirements/corrections, paths/IDs, decisions, evidence, risks and next steps. Keep active instructions and in-flight tasks intact. Preferred workflow: action=inspect reads paginated CURRENT boundary candidates (seq, preview, canStart/canEnd), action=prepare with explicit startSeq/endSeq returns a session-bound planId and size budget WITHOUT a summary, then action=compact with planId+your complete Markdown summary. Never use the current tool-call message as a boundary. Selection is your semantic responsibility; prepare does not declare a task finished. Small or low-net-benefit ranges are skipped without mutation: leave them intact, do not retry unchanged tiny ranges or cut required detail to pass. A stale plan or failed legacy anchor requires inspecting the CURRENT surface, not guessing/repeating anchors. Legacy startAnchor/endAnchor calls remain supported, strictly unique message prefixes, through the same boundary/value checks. Raw spans are archived; no LLM summarizer call. Tool, checkpoint and metadata token estimates are not exact future provider savings.',
+    description: 'Safely checkpoint ONE substantial fully concluded sub-task. Preserve exact requirements/corrections, paths/IDs, decisions, evidence, risks and next steps; keep active/live work intact. Efficient path: inspect once for an overview across the whole closed surface (groups are navigation bounds, NOT semantic recommendations); query searches literal prose, mode=detail with startSeq/endSeq focuses omitted rows. Do not scan every tool-result page. When boundaries and full checkpoint are known, compact directly with startSeq/endSeq+summary (no prepare needed). Otherwise prepare explicit IDs WITHOUT summary for a planId and conservative budget reserving both checkpoint and submitted-summary copies; compact planId+summary. IDs must be current observed boundaries with canStart/canEnd; never the current call. Selection/task completion is your responsibility. Small ranges stay intact: never trim necessary detail or combine unrelated/live tasks to pass. A successful-plan receipt can be replayed with planId alone (no summary); returns already_compacted without a second compaction. Move on rather than retrying it. Legacy exact unique-prefix anchors remain supported. Raw spans are archived. Host may invoke its official summarizer; token estimates are not exact provider savings.',
     parameters: {
       action: { type: 'string', enum: ['inspect', 'prepare', 'compact'], description: 'inspect is read-only; prepare selects explicit stable message IDs without writing a summary; compact commits a prepared checkpoint. Defaults to compact for legacy calls.' },
-      afterSeq: { type: 'number', description: 'inspect pagination cursor: last seq returned; omit for the beginning.' },
-      limit: { type: 'number', description: 'inspect page size, 1..24; default 16.' },
-      startSeq: { type: 'number', description: 'prepare only: explicit first seq from inspect with canStart=true.' },
-      endSeq: { type: 'number', description: 'prepare only: explicit inclusive last seq from inspect with canEnd=true; never current tool-call.' },
+      mode: { type: 'string', enum: ['overview', 'search', 'detail', 'messages'], description: 'inspect defaults to whole-surface overview; search literal query; detail focused rows; messages legacy paginated stream. Overview groups are only navigation bounds.' },
+      query: { type: 'string', description: 'inspect literal case-insensitive text search; searches prose and tool results, not arguments/reasoning. Implies search mode.' },
+      afterSeq: { type: 'number', description: 'inspect search/detail/messages cursor; advances in surface order. Alone selects legacy messages mode.' },
+      limit: { type: 'number', description: 'inspect group/row limit, 1..24; default 12.' },
+      startSeq: { type: 'number', description: 'prepare or direct compact: explicit first observed ID with canStart=true. inspect detail/search: inclusive focus start.' },
+      endSeq: { type: 'number', description: 'prepare or direct compact: explicit inclusive last observed ID with canEnd=true, never current call. inspect detail/search: focus end.' },
       planId: { type: 'string', description: 'compact only: planId from prepare; session-bound, single use, expires in 10 minutes; append-only activity outside the chosen span is allowed.' },
       startAnchor: { type: 'string', description: 'Verbatim opening of the span\'s first message. Required for a middle span; omitting starts at the conversation\'s first message, discarding opening requirements and direction — only for compressing all history up to endAnchor or rebaselining.' },
       endAnchor: { type: 'string', description: 'Verbatim opening of the span\'s last message; required. This node is replaced — pass its predecessor\'s opening to keep it.' },
-      summary: { type: 'string', description: 'compact only: your complete Markdown checkpoint. Do not send it with inspect/prepare (avoids duplicate payload). Preserve necessary information; if the full checkpoint exceeds the prepared budget, leave that span intact or select a different fully concluded task.' },
+      summary: { type: 'string', description: 'compact only: complete Markdown checkpoint; omit for receipt-only replay of a successful planId. Never send with inspect/prepare. Preserve all necessary information; if it cannot fit the prepared budget, leave the span intact or select another concluded task.' },
     },
     output: {
       // 显式声明真实字段（而非开放的 additionalProperties:true 空对象），
@@ -224,7 +229,11 @@ export function apply(ctx: Context, config: Config) {
         additionalProperties: false,
         properties: {
           ok: { type: 'boolean', required: true, description: 'True for inspection/preparation or successful compaction; false for a non-mutating skip/reselection. Only status=compacted means history was replaced.' },
-          status: { type: 'string', required: true, description: 'inspect, ready, skipped, needs_selection, stale_plan, busy, unavailable, or compacted.' },
+          status: { type: 'string', required: true, description: 'inspect, ready, skipped, needs_selection, stale_plan, busy, unavailable, compacted, or already_compacted (retry receipt; no new mutation).' },
+          mode: { type: 'string', description: 'Inspection discovery mode.' },
+          surface: { type: 'json', description: 'Closed surface counts and active-tail exclusion.' },
+          groups: { type: 'json', description: 'Whole-surface navigation groups with bounded landmark previews; NOT automatically selected tasks.' },
+          coverage: { type: 'json', description: 'Explicit returned/omitted counts; an overview is not a full transcript.' },
           reason: { type: 'string', description: 'Why no mutation occurred and the safe next step.' },
           planId: { type: 'string', description: 'Session-bound prepared range handle.' },
           candidates: { type: 'json', description: 'Bounded current message/closed-result boundary previews; not semantic compaction recommendations.' },
@@ -258,7 +267,43 @@ export function apply(ctx: Context, config: Config) {
       const noChange = (status: string, reason: string) => ({ ok: false, status, reason, archived: null })
       if (!['inspect', 'prepare', 'compact'].includes(String(action))) return noChange('needs_selection', 'Use inspect, prepare or compact.')
       if (action !== 'compact' && args.summary !== undefined) return noChange('needs_selection', 'Do not write a summary during inspection/preparation; send it only once at compact.')
-      if (action === 'compact' && (typeof args.summary !== 'string' || !args.summary.trim())) return noChange('needs_selection', 'compact requires your complete Markdown summary; inspect/prepare first, without summary.')
+      if (action === 'compact') {
+        const selectors = [args.planId !== undefined, args.startSeq !== undefined || args.endSeq !== undefined,
+          args.startAnchor !== undefined || args.endAnchor !== undefined].filter(Boolean).length
+        if (selectors > 1) return noChange('needs_selection', 'Do not mix planId, sequence IDs and legacy anchors. Choose exactly one selection method; no history changed.')
+      }
+      if (action === 'compact' && typeof args.planId === 'string') {
+        const previous = receipts.get(agent.session)?.get(args.planId)
+        if (previous && previous.until > Date.now()) {
+          // Receipt-only retries need no summary. Exact transport retries may still
+          // repeat it: remove only a pure direct replay call/result, never root prose.
+          const replayCallId = (exec as { callId?: unknown }).callId
+          const replayNodes = typeof replayCallId === 'string' ? await readSurfaceNodes(agent) : null
+          const holder = replayNodes?.find(n => soleToolCall(n, replayCallId as string) && pureCompactionCall(n))
+          if (holder) {
+            const off = ctx.on('session/event', (s: { id?: string } | undefined, ev: SessionEventLike) => {
+              if (s?.id !== agent.session.id || ev.type !== 'tool/result' ||
+                (ev.data as any)?.message?.source?.callId !== replayCallId) return
+              off()
+              queueMicrotask(() => {
+                try {
+                  const session = agent.session as any
+                  for (const seq of [holder.seq, ev.seq]) {
+                    if (typeof seq !== 'number') continue
+                    session.append('user/message', createShadowUserMessage('`context_compact` already_compacted: replay only; no second compaction. Original archive: ' + JSON.stringify(previous.value.archived)),
+                      { surfaceOp: { op: 'replace', startSeq: seq, endSeq: seq }, sourceEventSeqs: [seq] })
+                  }
+                } catch (error) { ctx.logger.warn('[context_compact] receipt replay cleanup failed: %s', String(error)) }
+              })
+            })
+          }
+          return { ...previous.value, status: 'already_compacted',
+            note: 'This plan already succeeded; no second compaction performed. Receipt-only retries need planId, not summary. Re-check pressure and inspect a different concluded task if needed.' }
+        }
+      }
+      if (action === 'compact' && (typeof args.summary !== 'string' || !args.summary.trim())) {
+        return noChange('needs_selection', 'compact requires a complete Markdown summary unless replaying a successful plan receipt.')
+      }
       // Acquire before the first await; no second plugin mutation can interleave.
       if (action === 'compact' && compacting.has(agent.session.id)) return noChange('busy', 'Another compaction is running in this session; wait and inspect again.')
       if (action === 'compact') compacting.add(agent.session.id)
@@ -282,10 +327,21 @@ export function apply(ctx: Context, config: Config) {
       const inspect = () => inspectSurface(nodes, cuts, meter, agent.session, boundaryCallId,
         typeof args.afterSeq === 'number' && Number.isSafeInteger(args.afterSeq) ? args.afterSeq : -1,
         typeof args.limit === 'number' && Number.isSafeInteger(args.limit) ? args.limit : 16)
-      if (action === 'inspect') return { ok: true, status: 'inspect', archived: null, ...inspect() }
+      if (action === 'inspect') {
+        if (args.mode === 'messages' || (!args.mode && !args.query && args.startSeq === undefined && args.afterSeq !== undefined)) {
+          return { ok: true, status: 'inspect', archived: null, ...inspect() }
+        }
+        try {
+          return { ok: true, status: 'inspect', archived: null, ...discoverSurface(nodes, cuts, meter, agent.session, boundaryCallId, {
+            mode: args.mode as DiscoveryOptions['mode'], query: args.query as string | undefined,
+            startSeq: args.startSeq as number | undefined, endSeq: args.endSeq as number | undefined,
+            afterSeq: args.afterSeq as number | undefined, limit: args.limit as number | undefined,
+          }) }
+        } catch (error) { return noChange('needs_selection', String((error as Error).message)) }
+      }
       let b: Region
       try {
-        if (action === 'prepare') b = seqRegion(nodes, args.startSeq, args.endSeq, cuts, boundaryCallId)
+        if (action === 'prepare' || (action === 'compact' && (args.startSeq !== undefined || args.endSeq !== undefined))) b = seqRegion(nodes, args.startSeq, args.endSeq, cuts, boundaryCallId)
         else if (typeof args.planId === 'string') b = plans.resolve(agent.session, args.planId, nodes, routeKey, cuts,
           r => selectionPrices(nodes, r, meter, agent.session), boundaryCallId)
         else {
@@ -293,7 +349,8 @@ export function apply(ctx: Context, config: Config) {
           b = seqRegion(nodes, legacy.startSeq, legacy.endSeq, cuts, boundaryCallId)
         }
       } catch (error) {
-        return { ...noChange(typeof args.planId === 'string' ? 'stale_plan' : 'needs_selection', String((error as Error).message)), ...inspect() }
+        return { ...noChange(typeof args.planId === 'string' ? 'stale_plan' : 'needs_selection', String((error as Error).message)),
+          ...discoverSurface(nodes, cuts, meter, agent.session, boundaryCallId) }
       }
       const estimateFor = (current: SurfaceNode[], r: Region, summary?: string) => {
         // Do not assume asynchronous cleanup will remove the submitted summary.
@@ -301,15 +358,15 @@ export function apply(ctx: Context, config: Config) {
         const measurement = meter.measure(agent.session)
         const holder = current[activeCallPosition(current, boundaryCallId)]
         const callCost = holder ? measurement.nodes.find(n => n.seq === holder.seq)?.tokens ?? 0 : 0
-        return benefit(sourcePrice(current, r, meter, agent.session), summary, meter,
+        return compactionBenefit(sourcePrice(current, r, meter, agent.session), summary, meter,
           config.minSourceTokens ?? MIN_SOURCE_TOKENS, config.minNetSavingsTokens ?? MIN_NET_SAVINGS_TOKENS,
-          callCost + 1024)
+          callCost)
       }
       let estimate = estimateFor(nodes, b, action === 'compact' ? args.summary as string : undefined)
       if (!estimate.useful) return { ...noChange('skipped', estimate.reason), estimate }
       if (action === 'prepare') return { ok: true, status: 'ready', archived: null, estimate,
         planId: plans.issue(agent.session, nodes, b, routeKey, selectionPrices(nodes, b, meter, agent.session)),
-        note: 'Write one complete checkpoint preserving necessary detail, then compact with this planId. Size estimates will be checked again including the submitted call; no semantic task completion is inferred.' }
+        note: 'Budget already reserves both checkpoint and submitted-summary copies. Write one complete checkpoint within maxCheckpointTokens; if necessary detail cannot fit, leave this span intact. A mixed/Code Mode call with unrelated payload can exceed the envelope: submit this compaction alone. Preparation does not infer task completion.' }
       const engine = resolveService(agent, 'compaction') as CompactionLike | undefined
       if (!engine) return noChange('unavailable', 'Compaction engine unavailable; no history changed.')
       const startSeq = b.startSeq, endSeq = b.endSeq
@@ -351,6 +408,21 @@ export function apply(ctx: Context, config: Config) {
         throw new Error('compaction rejected range [' + startSeq + ',' + endSeq + ']: ' + msg)
       }
       const usage = findSummaryUsage(agent.session, result.compactionId)
+      // A host may use its own summarizer. Report the committed body, never claim
+      // the submitted checkpoint estimate is the actual replacement size.
+      let actualCheckpointTokens: number | undefined
+      if (Array.isArray(result.summary)) {
+        try {
+          const frame = checkpointMessage('')
+          const measured = meter.estimateMessage({ ...frame, content: [frame.content[0], ...result.summary, frame.content[2]] })
+          if (Number.isFinite(measured) && measured >= 0) actualCheckpointTokens = measured
+        } catch (error) { ctx.logger.warn('[context_compact] committed checkpoint estimate unavailable: %s', String(error)) }
+      }
+      const committedEstimate = { ...estimate,
+        ...(actualCheckpointTokens === undefined ? {} : { actualCheckpointTokens,
+          actualEstimatedNetSavings: estimate.sourceTokens - actualCheckpointTokens - estimate.overheadTokens }),
+        basis: actualCheckpointTokens === undefined ? 'submitted checkpoint estimate only; actual replacement size unavailable' : 'committed checkpoint measured separately; submission overhead remains conservatively reserved',
+      }
       // 成对清理：检查点是单独注入的，为避免检查点文本在 surface 出现两次，
       // 将该 tool-call 的 assistant/message 与其 tool/result 各 shadow 为一个
       // 占位符（仅当该消息恰好只含这一个 tool-call 时才安全）。
@@ -417,19 +489,26 @@ export function apply(ctx: Context, config: Config) {
       const out: {
         ok: boolean
         status: string
-        estimate: ReturnType<typeof benefit>
+        estimate: ReturnType<typeof compactionBenefit> & { actualCheckpointTokens?: number; actualEstimatedNetSavings?: number; basis?: string }
         archived: { locator: JsonValue; retrievalHint: JsonValue } | null
         archiveError?: string
       } = {
         ok: true,
         status: 'compacted',
-        estimate,
+        estimate: committedEstimate,
         archived: archived ? {
           locator: archived.locator,
           retrievalHint: archived.retrievalHint,
         } : null,
       }
       if (archiveError) out.archiveError = typeof archiveError === 'string' ? archiveError : String(archiveError)
+      if (typeof args.planId === 'string') {
+        let saved = receipts.get(agent.session)
+        if (!saved) { saved = new Map(); receipts.set(agent.session, saved) }
+        for (const [id, receipt] of saved) if (receipt.until <= Date.now()) saved.delete(id)
+        while (saved.size >= 4) saved.delete(saved.keys().next().value!)
+        saved.set(args.planId, { until: Date.now() + 10 * 60 * 1000, value: out })
+      }
       return out
       } finally {
         if (action === 'compact') compacting.delete(agent.session.id)

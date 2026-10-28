@@ -101,6 +101,27 @@ export function benefit(sourceTokens: number, summary: string | undefined, meter
     accounting: 'Route-priced estimates, not exact future provider usage. Checkpoint framing and cleanup reserve included; read/prepare traffic is not claimed as savings.',
     reason: useful ? 'Substantial span; preserve all required details in the checkpoint.' : 'Low-value range: leave this small span intact. Choose another substantial completed task; do not trim required information or combine unrelated/live work merely to pass the minimum.' }
 }
+// Budget BOTH surviving copies up front: the checkpoint and its submitted tool
+// argument. The fixed envelope reserve also absorbs normal JSON escaping and
+// differences between prepare/compact call shapes. Never assume cleanup succeeds.
+export const SUBMISSION_ENVELOPE_TOKENS = 1024
+export const RESULT_RESERVE_TOKENS = 1024
+export function compactionBenefit(sourceTokens: number, summary: string | undefined, meter: Meter,
+  minSource = MIN_SOURCE_TOKENS, minNet = MIN_NET_SAVINGS_TOKENS, callTokens = 0) {
+  const checkpointTokens = summary === undefined ? null : meter.estimateMessage(checkpointMessage(summary))
+  if (checkpointTokens !== null && !validPrice(checkpointTokens)) throw new Error('Invalid checkpoint token estimate; refusing mutation.')
+  const fixedOverhead = CLEANUP_RESERVE_TOKENS + RESULT_RESERVE_TOKENS + SUBMISSION_ENVELOPE_TOKENS
+  const maxCheckpointTokens = Math.max(0, Math.floor((sourceTokens - fixedOverhead - minNet) / 2))
+  const submissionTokens = checkpointTokens === null ? null : Math.max(callTokens, checkpointTokens + SUBMISSION_ENVELOPE_TOKENS)
+  const overheadTokens = checkpointTokens === null ? fixedOverhead : CLEANUP_RESERVE_TOKENS + RESULT_RESERVE_TOKENS + submissionTokens!
+  const estimatedNetSavings = checkpointTokens === null ? null : sourceTokens - checkpointTokens - overheadTokens
+  const useful = sourceTokens >= minSource && maxCheckpointTokens >= meter.estimateMessage(checkpointMessage(''))
+    && (estimatedNetSavings === null || estimatedNetSavings >= minNet)
+  return { useful, sourceTokens, checkpointTokens, overheadTokens, submissionTokens, estimatedNetSavings, maxCheckpointTokens,
+    minSourceTokens: minSource, minNetSavingsTokens: minNet,
+    accounting: 'Route-priced estimates, not exact provider savings. Preparation reserves both checkpoint and submitted-summary copies, plus JSON/call envelope, result and cleanup. An unusually large mixed/Code Mode call can require more; avoid unrelated payload in the submission.',
+    reason: useful ? 'Substantial span; preserve all required details in the checkpoint.' : 'Insufficient net benefit including both checkpoint and submission. Leave this span intact; choose another substantial concluded task. Never trim required information or merge unrelated/live tasks to pass.' }
+}
 interface Plan extends Region { hash: string; until: number; route: string; prices: string }
 export class CompactionPlans {
   private readonly sessions = new WeakMap<object, Map<string, Plan>>()

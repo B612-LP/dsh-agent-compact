@@ -27,11 +27,71 @@ function harness(size=20000, archival=false) {
  const stop=apply(ctx,{autoArchive:archival,volumeNudgeTokens:300000,autoSafetyMarginTokens:65536,minSourceTokens:4096,minNetSavingsTokens:2048})
  const exec={agent,callId:'active',signal:new AbortController().signal}
  const run=args=>tool.execute(args,exec)
- return {run,session,agent,meter,engine,spill,exec,tool,get nodes(){return nodes},
+ return {run,ctx,session,agent,meter,engine,spill,exec,tool,get nodes(){return nodes},
   get archives(){return archives},get commits(){return commits},get summarySeen(){return summarySeen},
   replace:v=>{nodes=v;session.surface.nodes=v.map(n=>n.seq);session.surface.replaceGeneration++},
   route:v=>{route=v},dispose:()=>{stop();offs.forEach(f=>f())}}
 }
+
+test('direct observed sequence compact skips a prepare round trip without bypassing validation',async()=>{
+ const h=harness(20000,true)
+ try {
+  const done=await h.run({action:'compact',startSeq:1,endSeq:2,summary:'Complete task, exact corrections and evidence retained.'})
+  assert.equal(done.status,'compacted');assert.equal(h.commits,1)
+  assert.equal((await h.run({action:'compact',startSeq:1,endSeq:3,summary:'must not compact active call'})).status,'needs_selection')
+ }finally{h.dispose()}
+})
+test('successful receipt-only replay needs no summary; full pure retries are cleaned without losing mixed prose',async()=>{
+ for(const mixed of [false,true]) {
+  const h=harness(20000,true),replacements=[]
+  h.session.append=(type,data,options)=>replacements.push({type,data,options})
+  try {
+   const p=await h.run({action:'prepare',startSeq:1,endSeq:2})
+   assert.equal((await h.run({planId:p.planId,summary:'original facts'})).status,'compacted')
+   const replay=a(4,[...(mixed?[{type:'text',text:'Required root prose'}]:[]),
+    {type:'tool-call',name:'context_compact',id:'retry',arguments:'original facts '.repeat(1000)}])
+   h.replace([...h.nodes,replay]);h.exec.callId='retry'
+   assert.equal((await h.run({planId:p.planId})).status,'already_compacted')
+   h.ctx.emit('session/event',h.session,{seq:5,type:'tool/result',data:{message:{source:{callId:'retry'}}}})
+   await new Promise(resolve=>queueMicrotask(resolve))
+   assert.deepEqual(replacements.map(r=>r.options.surfaceOp.startSeq),mixed?[]:[4,5])
+   assert.ok(!JSON.stringify(replacements).includes('original facts'))
+   assert.equal(h.commits,1);assert.equal(h.archives,1)
+  }finally{h.dispose()}
+ }
+})
+test('partial or mixed direct sequence selectors never fall back to compressing the opening',async()=>{
+ const h=harness(20000,true)
+ try {
+  for(const selection of [{startSeq:2,endAnchor:'finished task complete'},{startSeq:2},{endSeq:2},
+    {planId:'unknown',startSeq:1,endSeq:2},{startSeq:1,endSeq:2,startAnchor:'finished task begins'}]) {
+   assert.equal((await h.run({...selection,summary:'all facts'})).status,'needs_selection')
+  }
+  assert.equal(h.archives+h.commits,0)
+ }finally{h.dispose()}
+})
+test('prepare reserves submitted summary growth: observed 4965-token budget no longer promises 1352 tokens',async()=>{
+ const h=harness(4465,true)
+ try {
+  const p=await h.run({action:'prepare',startSeq:1,endSeq:2})
+  assert.equal(p.status,'ready');assert.ok(p.estimate.maxCheckpointTokens<1120)
+  const summary='Retained facts. '.repeat(4)
+  const framed=h.meter.estimateMessage({role:'user',content:[{type:'text',text:summary}]})+100
+  assert.ok(framed<=p.estimate.maxCheckpointTokens)
+  h.nodes[2].tokens=framed+100
+  const done=await h.run({planId:p.planId,summary})
+  assert.equal(done.status,'compacted');assert.equal(h.commits,1)
+ }finally{h.dispose()}
+})
+test('committed host-generated checkpoint size is reported separately from submitted estimate',async()=>{
+ const h=harness(20000,true)
+ h.engine.compactRegion=async()=>({compactionId:'official',summary:[{type:'text',text:'official detailed checkpoint '.repeat(100)}]})
+ try {
+  const done=await h.run({startSeq:1,endSeq:2,summary:'complete submitted facts'})
+  assert.equal(done.status,'compacted');assert.ok(done.estimate.actualCheckpointTokens>done.estimate.checkpointTokens)
+  assert.ok(done.estimate.actualEstimatedNetSavings<done.estimate.estimatedNetSavings)
+ }finally{h.dispose()}
+})
 
 test('tiny 472-token screenshot case has no archive and no engine call, even with a short summary',async()=>{
  const h=harness(400,true);h.nodes[1].tokens=72
@@ -45,18 +105,18 @@ test('tiny 472-token screenshot case has no archive and no engine call, even wit
 test('inspect -> prepare without duplicated summary -> compact returns committed status and framed estimate',async()=>{
  const h=harness(20000,true)
  try {
-  const view=await h.run({action:'inspect'});assert.deepEqual(view.candidates.map(n=>n.seq),[1,2])
+  const view=await h.run({action:'inspect'});assert.deepEqual(view.groups.flatMap(g=>g.candidates.map(n=>n.seq)),[1,2])
   const p=await h.run({action:'prepare',startSeq:1,endSeq:2});assert.equal(p.status,'ready');assert.equal(h.archives,0)
   const result=await h.run({action:'compact',planId:p.planId,summary:'## Finished\nPreserve exact user correction, path, evidence and next steps.'})
   assert.equal(result.status,'compacted');assert.equal(h.commits,1);assert.equal(h.archives,1)
   assert.equal(h.summarySeen.provider,'agent');assert.equal(result.estimate.useful,true)
-  assert.equal((await h.run({planId:p.planId,summary:'old'})).status,'stale_plan')
+  assert.equal((await h.run({planId:p.planId,summary:'old'})).status,'already_compacted');assert.equal(h.commits,1);assert.equal(h.archives,1)
  }finally{h.dispose()}
 })
 test('legacy bad anchor is non-mutating and offers current boundary IDs instead of a red engine error',async()=>{
  const h=harness()
  try{const out=await h.run({startAnchor:'invented',endAnchor:'finished task complete',summary:'full summary'})
-  assert.equal(out.status,'needs_selection');assert.equal(out.candidates[0].seq,1);assert.equal(h.commits,0)
+  assert.equal(out.status,'needs_selection');assert.equal(out.groups[0].candidates[0].seq,1);assert.equal(h.commits,0)
  }finally{h.dispose()}
 })
 test('current tool-call prose cannot be the end; preserves nearby required text',async()=>{
@@ -114,7 +174,7 @@ test('Code Mode child uses the root call for boundaries and cost but never clean
  h.nodes[2].data.message.content=[{type:'text',text:'Important root explanation'},
   {type:'tool-call',id:'root',name:'run_code',arguments:'context_compact(...)'}]
  try{
-  const view=await h.run({action:'inspect'});assert.deepEqual(view.candidates.map(n=>n.seq),[1,2])
+  const view=await h.run({action:'inspect'});assert.deepEqual(view.groups.flatMap(g=>g.candidates.map(n=>n.seq)),[1,2])
   const p=await h.run({action:'prepare',startSeq:1,endSeq:2});assert.equal(p.status,'ready')
   const done=await h.run({planId:p.planId,summary:'## Complete\nPreserve original user correction, paths, evidence and active next step.'})
   assert.equal(done.status,'compacted');assert.equal(h.commits,1)
