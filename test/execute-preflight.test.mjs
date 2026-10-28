@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import { apply } from '../lib/index.js'
+import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 
 const u=(seq,text,tokens=10000)=>({seq,type:'user/message',data:{content:[{type:'text',text}]},tokens})
 const a=(seq,blocks,tokens=100)=>({seq,type:'assistant/message',data:{message:{content:blocks}},tokens})
@@ -26,7 +27,7 @@ function harness(size=20000, archival=false) {
  const offs=Object.entries(services).map(([key,value])=>ctx.provide(key,value))
  const stop=apply(ctx,{autoArchive:archival,volumeNudgeTokens:300000,autoSafetyMarginTokens:65536,minSourceTokens:4096,minNetSavingsTokens:2048})
  const exec={agent,callId:'active',signal:new AbortController().signal}
- const run=args=>tool.execute(args,exec)
+ const run=async args=>{const value=await tool.execute(args,exec);assert.notEqual(snapshotJsonValue(value),undefined,'tool output must be lossless JSON');return value}
  return {run,ctx,session,agent,meter,engine,spill,exec,tool,get nodes(){return nodes},
   get archives(){return archives},get commits(){return commits},get summarySeen(){return summarySeen},
   replace:v=>{nodes=v;session.surface.nodes=v.map(n=>n.seq);session.surface.replaceGeneration++},
@@ -70,15 +71,13 @@ test('partial or mixed direct sequence selectors never fall back to compressing 
   assert.equal(h.archives+h.commits,0)
  }finally{h.dispose()}
 })
-test('prepare reserves submitted summary growth: observed 4965-token budget no longer promises 1352 tokens',async()=>{
+test('legacy preparation is informational and imposes no per-range checkpoint budget',async()=>{
  const h=harness(4465,true)
  try {
   const p=await h.run({action:'prepare',startSeq:1,endSeq:2})
-  assert.equal(p.status,'ready');assert.ok(p.estimate.maxCheckpointTokens<1120)
+  assert.equal(p.status,'ready');assert.equal(p.estimate.advisoryOnly,true);assert.equal(p.estimate.maxCheckpointTokens,undefined)
   const summary='Retained facts. '.repeat(4)
-  const framed=h.meter.estimateMessage({role:'user',content:[{type:'text',text:summary}]})+100
-  assert.ok(framed<=p.estimate.maxCheckpointTokens)
-  h.nodes[2].tokens=framed+100
+  h.nodes[2].tokens=3000
   const done=await h.run({planId:p.planId,summary})
   assert.equal(done.status,'compacted');assert.equal(h.commits,1)
  }finally{h.dispose()}
@@ -93,30 +92,30 @@ test('committed host-generated checkpoint size is reported separately from submi
  }finally{h.dispose()}
 })
 
-test('tiny 472-token screenshot case has no archive and no engine call, even with a short summary',async()=>{
+test('small 472-token concluded span is no longer blocked by a plugin value gate',async()=>{
  const h=harness(400,true);h.nodes[1].tokens=72
  try {
   const result=await h.run({startAnchor:'finished task begins',endAnchor:'finished task complete',summary:'# Done'})
-  assert.equal(result.status,'skipped');assert.equal(result.ok,false)
-  assert.equal(h.archives,0);assert.equal(h.commits,0)
+  assert.equal(result.status,'compacted');assert.equal(result.ok,true)
+  assert.equal(h.archives,1);assert.equal(h.commits,1)
   assert.equal(h.engine._externalSummary,undefined)
  }finally{h.dispose()}
 })
 test('inspect -> prepare without duplicated summary -> compact returns committed status and framed estimate',async()=>{
  const h=harness(20000,true)
  try {
-  const view=await h.run({action:'inspect'});assert.deepEqual(view.groups.flatMap(g=>g.candidates.map(n=>n.seq)),[1,2])
+  const view=await h.run({action:'inspect'});assert.deepEqual(view.landmarks.map(n=>n.seq),[1,2])
   const p=await h.run({action:'prepare',startSeq:1,endSeq:2});assert.equal(p.status,'ready');assert.equal(h.archives,0)
   const result=await h.run({action:'compact',planId:p.planId,summary:'## Finished\nPreserve exact user correction, path, evidence and next steps.'})
   assert.equal(result.status,'compacted');assert.equal(h.commits,1);assert.equal(h.archives,1)
-  assert.equal(h.summarySeen.provider,'agent');assert.equal(result.estimate.useful,true)
+  assert.equal(h.summarySeen.provider,'agent');assert.equal(result.estimate.advisoryOnly,true)
   assert.equal((await h.run({planId:p.planId,summary:'old'})).status,'already_compacted');assert.equal(h.commits,1);assert.equal(h.archives,1)
  }finally{h.dispose()}
 })
 test('legacy bad anchor is non-mutating and offers current boundary IDs instead of a red engine error',async()=>{
  const h=harness()
  try{const out=await h.run({startAnchor:'invented',endAnchor:'finished task complete',summary:'full summary'})
-  assert.equal(out.status,'needs_selection');assert.equal(out.groups[0].candidates[0].seq,1);assert.equal(h.commits,0)
+  assert.equal(out.status,'needs_selection');assert.equal(out.landmarks[0].seq,1);assert.equal(h.commits,0)
  }finally{h.dispose()}
 })
 test('current tool-call prose cannot be the end; preserves nearby required text',async()=>{
@@ -153,10 +152,10 @@ test('same session parallel mutation is rejected; no second archive or engine en
   assert.equal((await h.run(args)).status,'busy');release();assert.equal((await first).status,'compacted');assert.equal(h.commits,1)
  }finally{h.dispose()}
 })
-test('full checkpoint plus submitted-call cost cannot create fake net benefit',async()=>{
+test('conservative low net estimate is informational, not a rejection gate',async()=>{
  const h=harness(4500,true);h.nodes[2].tokens=3000
  try{const out=await h.run({startAnchor:'finished task begins',endAnchor:'finished task complete',summary:'all required detail'})
-  assert.equal(out.status,'skipped');assert.equal(h.archives+h.commits,0)
+  assert.equal(out.status,'compacted');assert.equal(out.estimate.advisoryOnly,true);assert.equal(h.commits,1)
  }finally{h.dispose()}
 })
 test('cancellation after archive does not install a ticket; lock is released',async()=>{
@@ -174,7 +173,7 @@ test('Code Mode child uses the root call for boundaries and cost but never clean
  h.nodes[2].data.message.content=[{type:'text',text:'Important root explanation'},
   {type:'tool-call',id:'root',name:'run_code',arguments:'context_compact(...)'}]
  try{
-  const view=await h.run({action:'inspect'});assert.deepEqual(view.groups.flatMap(g=>g.candidates.map(n=>n.seq)),[1,2])
+  const view=await h.run({action:'inspect'});assert.deepEqual(view.landmarks.map(n=>n.seq),[1,2])
   const p=await h.run({action:'prepare',startSeq:1,endSeq:2});assert.equal(p.status,'ready')
   const done=await h.run({planId:p.planId,summary:'## Complete\nPreserve original user correction, paths, evidence and active next step.'})
   assert.equal(done.status,'compacted');assert.equal(h.commits,1)

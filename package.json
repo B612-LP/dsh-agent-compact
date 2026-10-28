@@ -1,7 +1,7 @@
 {
   "name": "@mimichunterz/agent-compact",
-  "version": "0.2.7",
-  "description": "Safe agent-directed span compaction with whole-surface discovery, direct stable-ID commits, conservative two-copy budgets and idempotent success receipts; automatic compaction stays on the official engine.",
+  "version": "0.3.0",
+  "description": "Two-call context maintenance: inspect once, batch all selected completed spans without per-range size/savings gates; safe async checkpoint injection, raw archives and idempotent receipts.",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/index.d.ts",

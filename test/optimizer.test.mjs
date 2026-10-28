@@ -1,6 +1,9 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-// Node 24 的原生 type stripping：直接测源码，不需要构建或写入 lib。
+import { Context, Service } from '@deepseek-ai/cordis'
+import { BasicCompactionEngine } from '@deepseek-ai/dsh-compaction-basic'
+import { Session } from '@deepseek-ai/dsh-session'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { PATCH_VERSION, patchEngine, runWithExternalSummary } from '../src/optimizer.ts'
 
 const agentOf = (id = 'shared-session') => ({ session: { id } })
@@ -10,14 +13,11 @@ const deferred = () => {
   return { promise, resolve }
 }
 const injected = (text) => ({
-  summary: [{ type: 'text', text }],
-  rawOutput: [],
-  llmStreamCall: false,
-  provider: 'agent',
-  model: 'agent',
-  maxTokens: 0,
+  summary: [{ type: 'text', text }], rawOutput: [], llmStreamCall: false,
+  provider: 'agent', model: 'agent', maxTokens: 0,
 })
-function fixture() {
+const span = { start: 1, end: 2 }
+function fixture({ dependencies = true } = {}) {
   const calls = []
   const official = { summary: [{ type: 'text', text: 'official' }] }
   const engine = {
@@ -25,302 +25,322 @@ function fixture() {
       calls.push({ receiver: this, input, agent, signal })
       return official
     },
-    // Basic compactRegion 同样会在首次 await 前同步调用 summarize。
-    async compactRegion(input, agent, signal) {
+    async compactRegion(start, end, agent, signal) {
       signal?.throwIfAborted()
-      return await this.summarize(input, agent, signal)
+      const input = { start, end }
+      return dependencies
+        ? this.regionDependencies().summarize(input, agent, signal)
+        : this.summarize(input, agent, signal)
     },
+    ...(dependencies ? {
+      regionDependencies() {
+        return { summarize: (input, agent, signal) => this.summarize(input, agent, signal) }
+      },
+    } : {}),
   }
   return { engine, calls, official }
 }
+const compact = (engine, agent, signal) => engine.compactRegion(1, 2, agent, signal)
+const run = (engine, agent, text, callback = () => compact(engine, agent)) =>
+  runWithExternalSummary(engine, agent, text, callback, span)
+async function assertReleased(engine, agent) {
+  assert.deepEqual(await run(engine, agent, 'next'), injected('next'))
+}
 
-// 精确模拟已发布 v3：原 summarizer 仅存在闭包，不提供 unpatch 句柄。
+function cordisFixture() {
+  const ctx = new Context()
+  const calls = []
+  const official = { summary: [{ type: 'text', text: 'official' }] }
+  class Engine extends Service {
+    constructor(ctx) { super(ctx, 'testEngine') }
+    async summarize(input, agent, signal) {
+      calls.push({ receiver: this, input, agent, signal, ctx: this.ctx })
+      return official
+    }
+    async compactRegion(start, end, agent, signal) {
+      await Promise.resolve()
+      return this.regionDependencies().summarize({ start, end }, agent, signal)
+    }
+    regionDependencies() {
+      return { summarize: (input, agent, signal) => this.summarize(input, agent, signal) }
+    }
+  }
+  const raw = new Engine(ctx)
+  class Agent extends Service {
+    constructor(ctx) { super(ctx, 'testAgent'); this.session = { id: 'same-session' } }
+  }
+  const rawAgent = new Agent(ctx)
+  const scoped = ctx.extend({ scopeLabel: 'caller-scope' })
+  return {
+    ctx, scoped, raw, rawAgent, official, calls,
+    read: (scope = scoped) => scope.get('testEngine', false),
+    agent: (scope = scoped) => scope.get('testAgent', false),
+  }
+}
+
+// 发布 v4 的实际错误形状：它比较新 proxy 与旧 proxy，并保留无法解包的闭包链。
+function installV4(engine) {
+  const original = engine.summarize
+  const summarize = async function (input, agent, signal) {
+    return original.call(this, input, agent, signal)
+  }
+  engine.summarize = summarize
+  engine[Symbol.for('@mimichunterz/agent-compact/optimizer/v4')] = {
+    engine, tickets: new WeakMap(), summarize,
+  }
+  engine.__ctxcOptimized = 4
+}
 function installV3(engine) {
   const original = engine.summarize.bind(engine)
   engine.summarize = async function (input, agent, signal) {
-    const sid = agent?.session?.id
-    const ext = this._externalSummary
-    if (sid && ext && typeof ext[sid] === 'string') {
-      const text = ext[sid]
-      delete ext[sid]
-      return injected(text)
-    }
+    const text = this._externalSummary?.[agent?.session?.id]
+    if (typeof text === 'string') return injected(text)
     return original(input, agent, signal)
   }
   engine.__ctxcOptimized = 3
 }
 
-async function assertReleased(engine, agent, text = 'next ticket') {
-  const result = await runWithExternalSummary(engine, agent, text,
-    () => engine.compactRegion({}, agent))
-  assert.deepEqual(result, injected(text))
-}
-
-test('patch is versioned, idempotent, and no-ticket calls forward official arguments and receiver', async () => {
+test('patch is versioned/idempotent and official fallback preserves receiver/input/signal', async () => {
   const { engine, calls, official } = fixture()
   const agent = agentOf()
-  const input = { span: [1, 2] }
+  const input = {}
   const signal = new AbortController().signal
-  assert.equal(PATCH_VERSION, 4)
+  assert.equal(PATCH_VERSION, 5)
   assert.equal(patchEngine(engine), true)
   const wrapper = engine.summarize
   assert.equal(patchEngine(engine), true)
   assert.equal(engine.summarize, wrapper)
-  assert.equal(engine.__ctxcOptimized, PATCH_VERSION)
   assert.equal(await engine.summarize(input, agent, signal), official)
   assert.deepEqual(calls, [{ receiver: engine, input, agent, signal }])
-  assert.equal(await engine.summarize(input, undefined), official)
   assert.equal(patchEngine({}), false)
 })
 
-test('helper invokes callback synchronously and returns exactly one compatible summary envelope', async () => {
+test('callback starts synchronously, consumes once, and legacy four-argument API works', async () => {
   const { engine, calls, official } = fixture()
   const agent = agentOf()
   let invoked = false
-  const pending = runWithExternalSummary(engine, agent, 'checkpoint', () => {
+  const result = runWithExternalSummary(engine, agent, 'checkpoint', () => {
     invoked = true
-    return engine.compactRegion({ span: [1, 2] }, agent)
+    return compact(engine, agent)
   })
-  assert.equal(invoked, true, 'install -> run -> consume must have no await gap')
-  assert.deepEqual(await pending, injected('checkpoint'))
-  assert.equal(calls.length, 0)
-  assert.equal(await engine.compactRegion({}, agent), official)
+  assert.equal(invoked, true)
+  assert.deepEqual(await result, injected('checkpoint'))
+  assert.equal(await compact(engine, agent), official)
   assert.equal(calls.length, 1)
   await assertReleased(engine, agent)
 })
 
-test('one ticket can only be consumed once even within the synchronous callback', async () => {
+test('async callback keeps operation ticket; parallel official work cannot steal it', async () => {
   const { engine, calls, official } = fixture()
-  const agent = agentOf()
-  const results = await runWithExternalSummary(engine, agent, 'one', () => {
-    const first = engine.summarize({ attempt: 1 }, agent)
-    const second = engine.summarize({ attempt: 2 }, agent)
-    return Promise.all([first, second])
-  })
-  assert.deepEqual(results, [injected('one'), official])
-  assert.equal(calls.length, 1)
-  assert.deepEqual(calls[0].input, { attempt: 2 })
-})
-
-test('different agent identities sharing the exact same session cannot steal a ticket', async () => {
-  const { engine, calls, official } = fixture()
-  const agent = agentOf()
-  const other = { session: agent.session }
-  const results = await runWithExternalSummary(engine, agent, 'owner only', () => {
-    const unrelated = engine.compactRegion({}, other)
-    const owned = engine.compactRegion({}, agent)
-    return Promise.all([unrelated, owned])
-  })
-  assert.deepEqual(results, [official, injected('owner only')])
-  assert.equal(calls.length, 1)
-  assert.equal(calls[0].agent, other)
-})
-
-test('same-engine same-agent concurrency rejects without running or removing the first ticket', async () => {
-  const { engine, calls } = fixture()
   const agent = agentOf()
   const gate = deferred()
-  const first = runWithExternalSummary(engine, agent, 'first', () => {
-    const summary = engine.compactRegion({}, agent)
-    return gate.promise.then(() => summary)
+  const pending = run(engine, agent, 'async checkpoint', async () => {
+    await gate.promise
+    return compact(engine, agent)
   })
-  let secondRan = false
-  await assert.rejects(runWithExternalSummary(engine, agent, 'second', () => {
-    secondRan = true
-  }), /already active/)
-  assert.equal(secondRan, false)
-  // 已消费不代表已释放互斥。
-  await assert.rejects(runWithExternalSummary(engine, agent, 'third', () => {}), /already active/)
+  assert.equal(await compact(engine, agent), official)
+  await assert.rejects(run(engine, agent, 'concurrent'), /already active/)
   gate.resolve()
-  assert.deepEqual(await first, injected('first'))
-  assert.equal(calls.length, 0)
-  await assertReleased(engine, agent)
+  assert.deepEqual(await pending, injected('async checkpoint'))
+  assert.equal(calls.length, 1)
 })
 
-test('pending tickets for different agents in one session remain independent', async () => {
+test('same-agent different span, direct summarize and borrowed receiver cannot steal ticket', async () => {
   const { engine, calls, official } = fixture()
-  const a = agentOf()
-  const b = { session: a.session }
-  const gate = deferred()
-  const first = runWithExternalSummary(engine, a, 'A', () => {
-    const summary = engine.compactRegion({}, a)
-    return gate.promise.then(() => summary)
+  const agent = agentOf()
+  const results = await run(engine, agent, 'owner', async () => {
+    const direct = await engine.summarize({}, agent)
+    const wrong = await engine.compactRegion(9, 10, agent)
+    const borrowed = await engine.compactRegion.call({
+      summarize: engine.summarize, regionDependencies: engine.regionDependencies,
+    }, 1, 2, agent)
+    const right = await compact(engine, agent)
+    const second = await compact(engine, agent)
+    return [direct, wrong, borrowed, right, second]
   })
-  const second = await runWithExternalSummary(engine, b, 'B', () => engine.compactRegion({}, b))
-  assert.deepEqual(second, injected('B'))
-  assert.equal(await engine.compactRegion({}, a), official)
-  assert.equal(await engine.compactRegion({}, b), official)
-  await assert.rejects(runWithExternalSummary(engine, a, 'steal', () => {}), /already active/)
-  gate.resolve()
-  assert.deepEqual(await first, injected('A'))
-  assert.equal(calls.length, 2)
+  assert.deepEqual(results, [official, official, official, injected('owner'), official])
+  assert.equal(calls.length, 4)
 })
 
-test('same agent on distinct engines has independent tickets and locks', async () => {
+test('agent identity rather than session identity; separate engines and agents remain independent', async () => {
   const left = fixture()
   const right = fixture()
-  const agent = agentOf()
-  const gate = deferred()
-  const first = runWithExternalSummary(left.engine, agent, 'left', () => {
-    const summary = left.engine.compactRegion({}, agent)
-    return gate.promise.then(() => summary)
+  const a = agentOf()
+  const b = { session: a.session }
+  const result = await run(left.engine, a, 'A', async () => {
+    const unrelated = await compact(left.engine, b)
+    const second = await run(left.engine, b, 'B')
+    const otherEngine = await run(right.engine, a, 'right')
+    const owned = await compact(left.engine, a)
+    return [unrelated, second, otherEngine, owned]
   })
-  assert.deepEqual(await runWithExternalSummary(right.engine, agent, 'right',
-    () => right.engine.compactRegion({}, agent)), injected('right'))
-  gate.resolve()
-  assert.deepEqual(await first, injected('left'))
+  assert.deepEqual(result, [left.official, injected('B'), injected('right'), injected('A')])
 })
 
-test('an engine inheriting a patched engine does not inherit its identity lock', async () => {
+test('consumed ticket remains locked until callback settles, then releases', async () => {
   const { engine } = fixture()
-  const derived = Object.create(engine)
-  const agent = agentOf()
-  const results = await runWithExternalSummary(engine, agent, 'base', () => {
-    const own = engine.compactRegion({}, agent)
-    const child = runWithExternalSummary(derived, agent, 'derived',
-      () => derived.compactRegion({}, agent))
-    return Promise.all([own, child])
-  })
-  assert.deepEqual(results, [injected('base'), injected('derived')])
-})
-
-test('borrowed summarize receiver cannot consume another engine ticket', async () => {
-  const { engine, calls, official } = fixture()
-  const agent = agentOf()
-  const otherEngine = {}
-  const results = await runWithExternalSummary(engine, agent, 'right receiver', () => {
-    const wrong = engine.summarize.call(otherEngine, {}, agent)
-    const right = engine.compactRegion({}, agent)
-    return Promise.all([wrong, right])
-  })
-  assert.deepEqual(results, [official, injected('right receiver')])
-  assert.equal(calls[0].receiver, otherEngine)
-})
-
-test('await-before-compact callback is disarmed; neither official nor delayed work steals summary', async () => {
-  const { engine, calls, official } = fixture()
   const agent = agentOf()
   const gate = deferred()
-  const pending = runWithExternalSummary(engine, agent, 'must not escape', async () => {
+  const pending = run(engine, agent, 'first', async () => {
+    const summary = await compact(engine, agent)
     await gate.promise
-    return engine.compactRegion({}, agent)
+    return summary
   })
-  assert.equal(await engine.compactRegion({ automatic: true }, agent), official)
-  await assert.rejects(runWithExternalSummary(engine, agent, 'concurrent', () => {}), /already active/)
+  await assert.rejects(run(engine, agent, 'second'), /already active/)
   gate.resolve()
-  assert.equal(await pending, official)
-  assert.equal(calls.length, 2)
+  assert.deepEqual(await pending, injected('first'))
   await assertReleased(engine, agent)
 })
 
-test('a callback which never consumes releases its ticket without affecting official compaction', async () => {
+test('detached descendants after settle are revoked and cannot steal a newer ticket', async () => {
   const { engine, official } = fixture()
   const agent = agentOf()
-  assert.equal(await runWithExternalSummary(engine, agent, 'unused', () => 42), 42)
-  assert.equal(await engine.compactRegion({}, agent), official)
-  await assertReleased(engine, agent)
+  const oldGate = deferred()
+  let detached
+  assert.equal(await run(engine, agent, 'expired', () => {
+    detached = oldGate.promise.then(() => compact(engine, agent))
+    return 42
+  }), 42)
+  const newGate = deferred()
+  const pending = run(engine, agent, 'new', async () => {
+    await newGate.promise
+    return compact(engine, agent)
+  })
+  oldGate.resolve()
+  assert.equal(await detached, official)
+  newGate.resolve()
+  assert.deepEqual(await pending, injected('new'))
 })
 
-test('fail-before-consume synchronous throw and async rejection both preserve error and release', async (t) => {
-  for (const asyncFailure of [false, true]) {
-    await t.test(asyncFailure ? 'rejection' : 'synchronous throw', async () => {
+test('exception, rejection and abort before/after consumption release exactly their own ticket', async (t) => {
+  for (const mode of ['throw', 'reject', 'abort-before', 'abort-pending', 'abort-after']) {
+    await t.test(mode, async () => {
       const { engine, official } = fixture()
       const agent = agentOf()
-      const error = new Error('range validation failed before summarize')
-      await assert.rejects(runWithExternalSummary(engine, agent, 'unused', () => {
-        if (asyncFailure) return Promise.reject(error)
-        throw error
-      }), (actual) => actual === error)
-      assert.equal(await engine.compactRegion({}, agent), official)
-      await assertReleased(engine, agent)
-    })
-  }
-})
-
-test('abort before consume and abort during an unconsumed pending operation both release', async (t) => {
-  await t.test('already aborted Basic-style compactRegion', async () => {
-    const { engine, official } = fixture()
-    const agent = agentOf()
-    const error = new Error('abort before consume')
-    const controller = new AbortController()
-    controller.abort(error)
-    await assert.rejects(runWithExternalSummary(engine, agent, 'unused',
-      () => engine.compactRegion({}, agent, controller.signal)), (actual) => actual === error)
-    assert.equal(await engine.compactRegion({}, agent), official)
-    await assertReleased(engine, agent)
-  })
-  await t.test('abort pending callback', async () => {
-    const { engine, official } = fixture()
-    const agent = agentOf()
-    const controller = new AbortController()
-    const error = new Error('abort pending')
-    const pending = runWithExternalSummary(engine, agent, 'unused', () => new Promise((_, reject) => {
-      controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true })
-    }))
-    controller.abort(error)
-    await assert.rejects(pending, (actual) => actual === error)
-    assert.equal(await engine.compactRegion({}, agent), official)
-    await assertReleased(engine, agent)
-  })
-})
-
-test('direct summarize with an aborted signal does not consume or inject', async () => {
-  const { engine, calls } = fixture()
-  const agent = agentOf()
-  const controller = new AbortController()
-  const error = new Error('aborted')
-  controller.abort(error)
-  await assert.rejects(runWithExternalSummary(engine, agent, 'unused',
-    () => engine.summarize({}, agent, controller.signal)), (actual) => actual === error)
-  assert.equal(calls.length, 0)
-  await assertReleased(engine, agent)
-})
-
-test('throw or abort after consumption cannot leave a ticket behind', async (t) => {
-  for (const abort of [false, true]) {
-    await t.test(abort ? 'abort' : 'throw', async () => {
-      const { engine, official } = fixture()
-      const agent = agentOf()
-      const error = new Error('failure after consumption')
+      const error = new Error(mode)
       const controller = new AbortController()
-      await assert.rejects(runWithExternalSummary(engine, agent, 'consumed', async () => {
-        assert.deepEqual(await engine.compactRegion({}, agent), injected('consumed'))
-        if (abort) {
+      const pending = run(engine, agent, 'unused', () => {
+        if (mode === 'throw') throw error
+        if (mode === 'reject') return Promise.reject(error)
+        if (mode === 'abort-before') {
+          controller.abort(error)
+          return compact(engine, agent, controller.signal)
+        }
+        if (mode === 'abort-pending') return new Promise((_, reject) => {
+          controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true })
+        })
+        return compact(engine, agent).then(() => {
           controller.abort(error)
           controller.signal.throwIfAborted()
-        }
-        throw error
-      }), (actual) => actual === error)
-      assert.equal(await engine.compactRegion({}, agent), official)
+        })
+      })
+      if (mode === 'abort-pending') controller.abort(error)
+      await assert.rejects(pending, (actual) => actual === error)
+      assert.equal(await compact(engine, agent), official)
       await assertReleased(engine, agent)
     })
   }
 })
 
-test('v3 upgrade and later legacy sid writes cannot contaminate official fallback', async () => {
+test('actual dependencies bind replay input; unrelated direct summarize inside preparation cannot steal', async () => {
+  const { engine, official } = fixture()
+  const agent = agentOf()
+  const originalDependencies = engine.regionDependencies
+  const unrelated = []
+  engine.regionDependencies = function () {
+    unrelated.push(this.summarize({ unrelated: true }, agent))
+    return originalDependencies.call(this)
+  }
+  assert.deepEqual(await run(engine, agent, 'real input'), injected('real input'))
+  assert.deepEqual(await Promise.all(unrelated), [official])
+})
+
+test('minimal engines without regionDependencies still scope the actual compactRegion operation', async () => {
+  const { engine } = fixture({ dependencies: false })
+  assert.deepEqual(await run(engine, agentOf(), 'minimal'), injected('minimal'))
+})
+
+test('real Cordis service/get/extended-context proxies inject across async boundaries and preserve context', async () => {
+  const f = cordisFixture()
+  assert.notEqual(f.read(), f.read())
+  assert.notEqual(f.read().summarize, f.read().summarize)
+  assert.notEqual(f.agent(), f.agent())
+  assert.deepEqual(await run(f.read(f.ctx), f.agent(f.ctx), 'proxy checkpoint', async () => {
+    await Promise.resolve()
+    return compact(f.read(), f.agent())
+  }), injected('proxy checkpoint'))
+  assert.equal(f.calls.length, 0)
+  assert.equal(await compact(f.read(), f.agent()), f.official)
+  assert.equal(f.calls.length, 1)
+  assert.equal(f.calls[0].ctx.scopeLabel, 'caller-scope', 'do not bind official fallback to root ctx')
+})
+
+test('real Cordis repeated proxy reads plus HMR module reloads never stack wrappers or lose locks', async () => {
+  const f = cordisFixture()
+  patchEngine(f.read())
+  const wrapper = f.raw.summarize
+  const compactWrapper = f.raw.compactRegion
+  const gate = deferred()
+  const pending = run(f.read(), f.agent(), 'original module', async () => {
+    await gate.promise
+    return compact(f.read(), f.agent())
+  })
+  for (let reload = 0; reload < 12; reload++) {
+    const module = await import(`../src/optimizer.ts?real-cordis-hmr=${reload}`)
+    for (let n = 0; n < 250; n++) assert.equal(module.patchEngine(f.read()), true)
+    assert.equal(f.raw.summarize, wrapper)
+    assert.equal(f.raw.compactRegion, compactWrapper)
+    await assert.rejects(module.runWithExternalSummary(f.read(), f.agent(), 'conflict', () => {}, span), /already active/)
+  }
+  gate.resolve()
+  assert.deepEqual(await pending, injected('original module'))
+  assert.equal(await compact(f.read(), f.agent()), f.official)
+  assert.equal(f.calls.length, 1)
+})
+
+test('migrates thousands of legacy v4 proxy wrappers without entering recursive chain', async () => {
+  const f = cordisFixture()
+  for (let n = 0; n < 3000; n++) installV4(f.read())
+  assert.equal(patchEngine(f.read()), true)
+  assert.deepEqual(await run(f.read(), f.agent(), 'recovered'), injected('recovered'))
+  assert.equal(await compact(f.read(), f.agent()), f.official)
+  assert.equal(f.calls.length, 1)
+  assert.equal(f.calls[0].ctx.scopeLabel, 'caller-scope')
+})
+
+test('legacy v4 object without recoverable prototype fails explicitly, never recurses', () => {
+  const { engine } = fixture()
+  installV4(engine)
+  assert.throws(() => patchEngine(engine), /cannot safely recover legacy v4/)
+})
+
+test('old v3 sid cache is ignored before/after upgrade and before official fallback', async () => {
   const { engine, calls, official } = fixture()
   const agent = agentOf()
   installV3(engine)
-  engine._externalSummary = { [agent.session.id]: 'stale before upgrade' }
-  assert.equal(patchEngine(engine), true)
-  assert.equal(engine.__ctxcOptimized, PATCH_VERSION)
-  assert.equal(await engine.compactRegion({}, agent), official)
-  engine._externalSummary = { [agent.session.id]: 'legacy writer after upgrade' }
-  assert.equal(await engine.compactRegion({}, agent), official)
+  engine._externalSummary = { [agent.session.id]: 'stale' }
+  patchEngine(engine)
+  assert.equal(await compact(engine, agent), official)
+  engine._externalSummary = { [agent.session.id]: 'legacy writer' }
+  assert.equal(await compact(engine, agent), official)
   assert.equal(engine._externalSummary, undefined)
-  engine._externalSummary = { [agent.session.id]: 'stale before failure' }
-  await assert.rejects(runWithExternalSummary(engine, agent, 'unused', () => {
-    throw new Error('validation failed')
-  }), /validation failed/)
-  assert.equal(await engine.compactRegion({}, agent), official)
-  assert.equal(calls.length, 3)
-  await assertReleased(engine, agent)
-  engine._externalSummary = { [agent.session.id]: 'legacy writer after success' }
-  assert.equal(await engine.compactRegion({}, agent), official)
+  assert.deepEqual(await run(engine, agent, 'owned'), injected('owned'))
+  assert.equal(calls.length, 2)
 })
 
-test('official fallback rejection is passed through, not intercepted or disabled', async () => {
-  const error = new Error('official summarizer failure')
+test('derived engines have their own identities and do not inherit parent locks or wrappers', async () => {
+  const { engine } = fixture()
+  const derived = Object.create(engine)
+  const agent = agentOf()
+  const result = await run(engine, agent, 'base', async () => {
+    const child = await run(derived, agent, 'derived')
+    return [child, await compact(engine, agent)]
+  })
+  assert.deepEqual(result, [injected('derived'), injected('base')])
+})
+
+test('official fallback failure passes through exactly once', async () => {
+  const error = new Error('official failure')
   let calls = 0
   const engine = { summarize() { calls++; throw error } }
   patchEngine(engine)
@@ -328,34 +348,69 @@ test('official fallback rejection is passed through, not intercepted or disabled
   assert.equal(calls, 1)
 })
 
-test('module reload shares per-engine identity lock and does not stack wrappers', async () => {
-  const reloaded = await import('../src/optimizer.ts?optimizer-reload-test')
-  const { engine } = fixture()
-  const agent = agentOf()
-  const gate = deferred()
-  const first = runWithExternalSummary(engine, agent, 'first module', () => {
-    const summary = engine.compactRegion({}, agent)
-    return gate.promise.then(() => summary)
-  })
-  const wrapper = engine.summarize
-  assert.equal(reloaded.patchEngine(engine), true)
-  assert.equal(engine.summarize, wrapper)
-  await assert.rejects(reloaded.runWithExternalSummary(engine, agent, 'other module', () => {}), /already active/)
-  gate.resolve()
-  assert.deepEqual(await first, injected('first module'))
-  assert.deepEqual(await reloaded.runWithExternalSummary(engine, agent, 'reloaded',
-    () => engine.compactRegion({}, agent)), injected('reloaded'))
+test('span IDs are identities, not numeric order after checkpoint replacements',async()=>{
+ const {engine,calls}=fixture(),agent=agentOf()
+ const selected={start:9105,end:7081}
+ const result=await runWithExternalSummary(engine,agent,'all facts',()=>engine.compactRegion(selected.start,selected.end,agent),selected)
+ assert.deepEqual(result,injected('all facts'));assert.equal(calls.length,0)
 })
 
-test('invalid helper inputs fail before callback; a numeric version alone is not trusted', async () => {
+test('invalid inputs and numeric version alone cannot install or skip a ticket', async () => {
   const { engine } = fixture()
   let ran = false
-  const run = () => { ran = true }
-  await assert.rejects(runWithExternalSummary(engine, null, 'text', run), /identity/)
-  await assert.rejects(runWithExternalSummary(engine, agentOf(), undefined, run), /string/)
+  const callback = () => { ran = true }
+  await assert.rejects(runWithExternalSummary(engine, null, 'text', callback), /identity/)
+  await assert.rejects(runWithExternalSummary(engine, agentOf(), undefined, callback), /string/)
   await assert.rejects(runWithExternalSummary(engine, agentOf(), 'text', undefined), /callback/)
-  await assert.rejects(runWithExternalSummary({}, agentOf(), 'text', run), /unavailable/)
+  await assert.rejects(runWithExternalSummary({}, agentOf(), 'text', callback), /unavailable/)
+  await assert.rejects(runWithExternalSummary(engine, agentOf(), 'text', callback, { start: -1, end: 1 }), /span/)
   assert.equal(ran, false)
   engine.__ctxcOptimized = PATCH_VERSION
-  await assertReleased(engine, agentOf(), 'not skipped')
+  await assertReleased(engine, agentOf())
+})
+
+test('actual Basic engine commits injected replay summary on detached Session after legacy/HMR migration', async () => {
+  const ctx = new Context()
+  const session = Session.create('optimizer-detached-runtime-fixture')
+  session.append('turn/start', { turn: 'fixture-turn' })
+  const start = session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'resolved history '.repeat(500) }],
+  }), { surfaceOp: 'append' }).seq
+  const end = session.append('user/message', createUserMessage({
+    content: [{ type: 'text', text: 'closed followup '.repeat(500) }],
+  }), { surfaceOp: 'append' }).seq
+  ctx.provide('tokenMeter', {
+    measure(owner) {
+      return { nodes: owner.surface.nodes.map((seq) => ({ seq, tokens: 10000, heuristicTokens: 10000 })) }
+    },
+    estimateMessage() { return 20 },
+  })
+  // 没有提供 LLM：任何静默官方 fallback 都会使本测试失败；不接触磁盘 session。
+  const raw = new BasicCompactionEngine(ctx, { auto: false })
+  const automaticHook = raw.compactIfNeeded
+  const read = () => ctx.get('compaction', false)
+  for (let n = 0; n < 1000; n++) installV4(read())
+  const reloaded = await import('../src/optimizer.ts?actual-basic-runtime-hmr')
+  for (let n = 0; n < 1000; n++) reloaded.patchEngine(read())
+  assert.equal(raw.compactIfNeeded, automaticHook, 'automatic policy method stays untouched')
+  const agent = { session }
+  const result = await reloaded.runWithExternalSummary(read(), agent, 'runtime checkpoint', async () => {
+    await Promise.resolve()
+    return read().compactRegion(start, end, agent)
+  }, { start, end })
+  assert.deepEqual(result.summary, [{ type: 'text', text: 'runtime checkpoint' }])
+  assert.deepEqual(result.shadowedSeqs, [start, end])
+  assert.equal(session.surface.nodes.length, 1)
+  assert.equal(session.eventAt(result.endSeq).type, 'compaction/end')
+  assert.equal(session.eventAt(result.endSeq).data.error, undefined)
+  assert.equal(session.eventAt(result.summarySeq).data.provider, 'agent')
+})
+
+test('runtime BasicCompactionEngine dependency callback binds the injected input through real Cordis receiver', async () => {
+  const f = cordisFixture()
+  // 使用实际安装版本的 dependency 回调，而不触及任何真实 session 或 LLM。
+  f.raw.regionDependencies = BasicCompactionEngine.prototype.regionDependencies
+  f.scoped.provide('tokenMeter', {})
+  assert.deepEqual(await run(f.read(), f.agent(), 'runtime hook'), injected('runtime hook'))
+  assert.equal(f.calls.length, 0)
 })

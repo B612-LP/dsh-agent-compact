@@ -69,7 +69,8 @@ export function seqRegion(nodes: SurfaceNode[], start: unknown, end: unknown, cu
   if (si < 0 || ei < 0) throw new Error('Selected boundary no longer exists; inspect the current surface again.')
   if (si > ei) throw new Error('Selected start is after end; choose the intended ordered range.')
   if (ei >= activeCallPosition(nodes, callId)) throw new Error('The current tool-call message or its active tail cannot be compressed. Select an earlier closed message.')
-  if (!messageNode(nodes[si]) || !messageNode(nodes[ei])) throw new Error('Explicit boundaries must be text messages or closed tool results from inspect, not tool arguments or reasoning.')
+  const startIsCall = nodes[si].type === 'assistant/message' && content(nodes[si]).some(b => b?.type === 'tool-call')
+  if ((!messageNode(nodes[si]) && !startIsCall) || !messageNode(nodes[ei])) throw new Error('Explicit boundaries must be observed text messages or closed tool results; a disclosed balanced tool-step call may start its results. Reasoning-only nodes are not boundaries.')
   if (!cuts.before(start) || !cuts.after(end)) throw new Error('Selected boundaries split an open tool-call/result step. Inspect canStart/canEnd and select a closed boundary; do not auto-widen the span.')
   return { si, ei, startSeq: start, endSeq: end }
 }
@@ -121,6 +122,17 @@ export function compactionBenefit(sourceTokens: number, summary: string | undefi
     minSourceTokens: minSource, minNetSavingsTokens: minNet,
     accounting: 'Route-priced estimates, not exact provider savings. Preparation reserves both checkpoint and submitted-summary copies, plus JSON/call envelope, result and cleanup. An unusually large mixed/Code Mode call can require more; avoid unrelated payload in the submission.',
     reason: useful ? 'Substantial span; preserve all required details in the checkpoint.' : 'Insufficient net benefit including both checkpoint and submission. Leave this span intact; choose another substantial concluded task. Never trim required information or merge unrelated/live tasks to pass.' }
+}
+// Informational only. The user selects all concluded ranges in a batch; a small
+// member or a conservative negative estimate is not a reason to reject it.
+export function compactionEstimate(sourceTokens: number, summary: string | undefined, meter: Meter, callTokens = 0) {
+  const checkpointTokens = summary === undefined ? null : meter.estimateMessage(checkpointMessage(summary))
+  if (checkpointTokens !== null && !validPrice(checkpointTokens)) throw new Error('Invalid checkpoint token estimate; refusing unsafe accounting.')
+  const submissionTokens = checkpointTokens === null ? callTokens : Math.max(callTokens, checkpointTokens + SUBMISSION_ENVELOPE_TOKENS)
+  const overheadTokens = CLEANUP_RESERVE_TOKENS + RESULT_RESERVE_TOKENS + submissionTokens
+  return { advisoryOnly: true, sourceTokens, checkpointTokens, submissionTokens, overheadTokens,
+    estimatedNetSavings: checkpointTokens === null ? null : sourceTokens - checkpointTokens - overheadTokens,
+    accounting: 'Informational route-priced estimates, not exact provider savings. No plugin minimum source-size or net-savings gate. Preserve all required information; the host still validates replacement structure and summary size.' }
 }
 interface Plan extends Region { hash: string; until: number; route: string; prices: string }
 export class CompactionPlans {
