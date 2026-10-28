@@ -7,7 +7,7 @@
 // 匹配到的边缘会被吸附到平衡的 tool-call/result 边界上。
 
 import { normText } from './normalize.js'
-import { nodeFlatText } from './surface-text.js'
+import { nodeContent, nodeFlatText } from './surface-text.js'
 import type { SurfaceNode } from './optimizer.js'
 
 interface SurfaceNodeErrorData {
@@ -56,6 +56,12 @@ function strippedText(s: string): string {
   )
 }
 
+function anchorText(node: SurfaceNode): string {
+  const blocks = nodeContent(node)
+  if (!Array.isArray(blocks)) return ''
+  return blocks.filter(b => b?.type === 'text' && typeof b.text === 'string').map(b => b.text).join('\n')
+}
+
 // 一个节点能否作为锚点匹配目标：只看 user/message、assistant/message；
 // tool/result 节点不参与匹配，进行中轮次的 tool-call 节点也被排除。
 // prefixHits（真正匹配）与 nearestHint（失败提示）共用同一条资格线，
@@ -63,6 +69,7 @@ function strippedText(s: string): string {
 function isEligibleAnchorNode(nodes: SurfaceNode[], i: number): boolean {
   const node = nodes[i]
   if (node.type !== 'user/message' && node.type !== 'assistant/message') return false
+  if (!anchorText(node).trim()) return false
   if (i === nodes.length - 1 && /\[tool-call/.test(nodeText(node, true))) return false
   return true
 }
@@ -74,8 +81,8 @@ export function prefixHits(nodes: SurfaceNode[], anchor: string): number[] {
   for (let i = 0; i < nodes.length; i++) {
     if (!isEligibleAnchorNode(nodes, i)) continue
     const node = nodes[i]
-    const n = normText(nodeText(node, true))
-    const s = strippedText(nodeText(node, true))
+    const n = normText(anchorText(node))
+    const s = strippedText(anchorText(node))
     if (n.startsWith(a) || s.startsWith(a)) hits.push(i)
   }
   return hits
@@ -85,7 +92,7 @@ export function prefixHits(nodes: SurfaceNode[], anchor: string): number[] {
 // 前缀（preamble + `<compacted-summary>` 标签）时，直接截前 80 字会让预览
 // 完全一样。先跳过候选共享的最长公共前缀再截，让预览从真正分叉处开始。
 function hitPreview(nodes: SurfaceNode[], hits: number[]): string {
-  const texts = hits.map((i) => nodeText(nodes[i], true))
+  const texts = hits.map((i) => anchorText(nodes[i]))
   const shared = hits.length > 1 ? commonPrefixLen(texts) : 0
   return hits.map((i, k) => nodeSummaryLine(nodes, i, shared, texts[k])).join('\n')
 }
@@ -106,7 +113,7 @@ function commonPrefixLen(texts: string[]): number {
 // 匹配失败提示复用的单行摘要：`pos <下标> | seq <序号> | <类型>: <前 80 字预览>`。
 // skip>0 时表示与其它候选共享的前缀已被跳过，预览从分叉点开始（并标注跳过量）。
 function nodeSummaryLine(nodes: SurfaceNode[], i: number, skip?: number, text?: string): string {
-  const full = text ?? nodeText(nodes[i], true)
+  const full = text ?? anchorText(nodes[i])
   const shown = skip ? full.slice(skip) : full
   const tag = skip ? ' (shared ' + skip + '-char prefix elided)' : ''
   return 'pos ' + i + ' | seq ' + nodes[i].seq + ' | ' + nodes[i].type + tag + ': ' + preview(shown, 80)
@@ -137,7 +144,7 @@ function nearestHint(nodes: SurfaceNode[], anchorNorm: string): string {
   const scored = nodes
     .map((_, i) => i)
     .filter((i) => isEligibleAnchorNode(nodes, i))
-    .map((i) => ({ i: i, score: anchorOverlap(nodeText(nodes[i], true), anchorNorm) }))
+    .map((i) => ({ i: i, score: anchorOverlap(anchorText(nodes[i]), anchorNorm) }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 3)
     .filter((s) => s.score > 0)

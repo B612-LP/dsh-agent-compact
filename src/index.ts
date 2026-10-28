@@ -11,7 +11,10 @@ import type { JsonValue } from '@deepseek-ai/dsh-util-values'
 import Schema from '@deepseek-ai/schemastery'
 import type { Context } from '@deepseek-ai/cordis'
 import { createShadowUserMessage } from './shadow-message.js'
-import { patchEngine } from './optimizer.js'
+import { runWithExternalSummary } from './optimizer.js'
+import { toolPairingBalancedBefore, toolPairingBalancedAfter } from '@deepseek-ai/dsh-compaction'
+import { CompactionPlans, inspectSurface, seqRegion, fingerprint, selectionPrices, sourcePrice, benefit, pureCompactionCall, activeCallPosition, MIN_SOURCE_TOKENS, MIN_NET_SAVINGS_TOKENS } from './preflight.js'
+import type { Region, Meter } from './preflight.js'
 import { normText } from './normalize.js'
 import { CtxSurfaceService } from './ctx-surface.js'
 import { resolveBoundaries, soleToolCall, spanText } from './boundary.js'
@@ -26,9 +29,13 @@ export interface Config {
   autoArchive: boolean
   volumeNudgeTokens: number
   autoSafetyMarginTokens: number
+  minSourceTokens: number
+  minNetSavingsTokens: number
 }
 
 export const Config: Schema<Config> = Schema.object({
+  minSourceTokens: Schema.number().min(1).default(MIN_SOURCE_TOKENS).description('Minimum route-priced source span for compaction (default 4096). Smaller completed tasks stay intact; never discard detail or combine live/unrelated tasks to pass this guard.'),
+  minNetSavingsTokens: Schema.number().min(1).default(MIN_NET_SAVINGS_TOKENS).description('Minimum estimated net reduction after checkpoint framing, current tool-call cost and result/cleanup reserves (default 2048). Estimates are not exact provider savings.'),
   autoArchive: Schema.boolean().default(true).description('context_compact saves the full raw span to a spill artifact before replacing it.'),
   volumeNudgeTokens: Schema.number().min(0).default(300000).description('Absolute current-occupancy bands: notice from 5/6 of this amount (default 250k), continuous maintenance from this amount (300k). Once continuous, keep prompting until below the notice band. Not growth since compaction or a percentage of context capacity. 0 disables these quality bands.'),
   autoSafetyMarginTokens: Schema.number().min(0).default(65536).description('Secondary overflow guard: also warn this many tokens before the routed official auto-compaction threshold; capped for very small models. Does not scale or postpone the absolute 250k/300k quality bands.'),
@@ -190,16 +197,24 @@ export function apply(ctx: Context, config: Config) {
   }
 
   const disposers: (() => void)[] = []
+  const plans = new CompactionPlans()
+  const compacting = new Set<string>()
 
   disposers.push(registerProactiveCompaction(ctx, config))
 
   disposers.push(tools.register(defineTool({
     name: 'context_compact',
-    description: 'Compress a past conversation span into one Markdown checkpoint you write; the raw span is archived to a spill artifact, the compaction recorded. Anchor matching: anchors match the opening text of a message body (user/assistant messages only; tool-call blocks, tool results, and other transcript structure excluded). Whitespace, tool-call markers, and full/half-width punctuation differences are ignored; each anchor must match exactly one user or assistant message. When to compact: ① Progress — compact each finished step at its topic boundary, keeping the active instruction and remaining steps live; ② Course correction — compact the failed span into a checkpoint recording what went wrong and the corrected direction, instead of carrying noise forward; ③ Rebaseline — stale opening requirements: compact the start too, restating current intent and what survives. Checkpoint: Markdown, terse bullets, ## sections; keep exact paths/commands/IDs and the user\'s requirements and direction. Per scene — Progress: Primary Request and Intent / Key Technical Concepts / Files and Code / Errors and Fixes / Current Work / Next Step; Correction: what went wrong / root cause / fix / next; Rebaseline: current intent / surviving decisions / plan ahead. Constraints: one compaction per session at a time; checkpoint must be smaller than the compressed span; edges snap to balanced tool-call/result boundaries.',
+    description: 'Safely checkpoint ONE substantial, fully concluded sub-task, preserving exact requirements/corrections, paths/IDs, decisions, evidence, risks and next steps. Keep active instructions and in-flight tasks intact. Preferred workflow: action=inspect reads paginated CURRENT boundary candidates (seq, preview, canStart/canEnd), action=prepare with explicit startSeq/endSeq returns a session-bound planId and size budget WITHOUT a summary, then action=compact with planId+your complete Markdown summary. Never use the current tool-call message as a boundary. Selection is your semantic responsibility; prepare does not declare a task finished. Small or low-net-benefit ranges are skipped without mutation: leave them intact, do not retry unchanged tiny ranges or cut required detail to pass. A stale plan or failed legacy anchor requires inspecting the CURRENT surface, not guessing/repeating anchors. Legacy startAnchor/endAnchor calls remain supported, strictly unique message prefixes, through the same boundary/value checks. Raw spans are archived; no LLM summarizer call. Tool, checkpoint and metadata token estimates are not exact future provider savings.',
     parameters: {
+      action: { type: 'string', enum: ['inspect', 'prepare', 'compact'], description: 'inspect is read-only; prepare selects explicit stable message IDs without writing a summary; compact commits a prepared checkpoint. Defaults to compact for legacy calls.' },
+      afterSeq: { type: 'number', description: 'inspect pagination cursor: last seq returned; omit for the beginning.' },
+      limit: { type: 'number', description: 'inspect page size, 1..24; default 16.' },
+      startSeq: { type: 'number', description: 'prepare only: explicit first seq from inspect with canStart=true.' },
+      endSeq: { type: 'number', description: 'prepare only: explicit inclusive last seq from inspect with canEnd=true; never current tool-call.' },
+      planId: { type: 'string', description: 'compact only: planId from prepare; session-bound, single use, expires in 10 minutes; append-only activity outside the chosen span is allowed.' },
       startAnchor: { type: 'string', description: 'Verbatim opening of the span\'s first message. Required for a middle span; omitting starts at the conversation\'s first message, discarding opening requirements and direction — only for compressing all history up to endAnchor or rebaselining.' },
       endAnchor: { type: 'string', description: 'Verbatim opening of the span\'s last message; required. This node is replaced — pass its predecessor\'s opening to keep it.' },
-      summary: { type: 'string', description: 'Required. The full Markdown checkpoint replacing the span, written by you from the conversation; never verbatim. Per-scene structure as in the description; must be smaller than the compressed content.' },
+      summary: { type: 'string', description: 'compact only: your complete Markdown checkpoint. Do not send it with inspect/prepare (avoids duplicate payload). Preserve necessary information; if the full checkpoint exceeds the prepared budget, leave that span intact or select a different fully concluded task.' },
     },
     output: {
       // 显式声明真实字段（而非开放的 additionalProperties:true 空对象），
@@ -208,7 +223,14 @@ export function apply(ctx: Context, config: Config) {
         type: 'object',
         additionalProperties: false,
         properties: {
-          ok: { type: 'boolean', required: true, description: 'Always true on a successful call (a failure throws instead).' },
+          ok: { type: 'boolean', required: true, description: 'True for inspection/preparation or successful compaction; false for a non-mutating skip/reselection. Only status=compacted means history was replaced.' },
+          status: { type: 'string', required: true, description: 'inspect, ready, skipped, needs_selection, stale_plan, busy, unavailable, or compacted.' },
+          reason: { type: 'string', description: 'Why no mutation occurred and the safe next step.' },
+          planId: { type: 'string', description: 'Session-bound prepared range handle.' },
+          candidates: { type: 'json', description: 'Bounded current message/closed-result boundary previews; not semantic compaction recommendations.' },
+          nextAfterSeq: { type: 'json', description: 'Next inspection cursor or null.' },
+          estimate: { type: 'json', description: 'Source, framed checkpoint, overhead and estimated reduction; not exact provider savings.' },
+          note: { type: 'string', description: 'Selection and retention constraints.' },
           archived: {
             required: true,
             oneOf: [
@@ -232,24 +254,68 @@ export function apply(ctx: Context, config: Config) {
     async execute(args, exec) {
       const agent = agentOf(exec)
       if (!agent) throw new Error('no agent session available for this call')
-      if (typeof args.summary !== 'string' || !args.summary.trim()) {
-        throw new Error('summary is REQUIRED: write the Markdown checkpoint yourself (this tool makes no LLM summarizer call)')
-      }
-      const engine = resolveService(agent, 'compaction') as CompactionLike | undefined
-      if (!engine) throw new Error('compaction service is not available in this runtime (tried host plane and preset realm)')
-      patchEngine(engine as unknown as OptimizedEngineLike)
+      const action = args.action ?? 'compact'
+      const noChange = (status: string, reason: string) => ({ ok: false, status, reason, archived: null })
+      if (!['inspect', 'prepare', 'compact'].includes(String(action))) return noChange('needs_selection', 'Use inspect, prepare or compact.')
+      if (action !== 'compact' && args.summary !== undefined) return noChange('needs_selection', 'Do not write a summary during inspection/preparation; send it only once at compact.')
+      if (action === 'compact' && (typeof args.summary !== 'string' || !args.summary.trim())) return noChange('needs_selection', 'compact requires your complete Markdown summary; inspect/prepare first, without summary.')
+      // Acquire before the first await; no second plugin mutation can interleave.
+      if (action === 'compact' && compacting.has(agent.session.id)) return noChange('busy', 'Another compaction is running in this session; wait and inspect again.')
+      if (action === 'compact') compacting.add(agent.session.id)
+      try {
       const nodes = await readSurfaceNodes(agent)
-      if (nodes === null) throw new Error('sessionQuery service is not available in this runtime')
-      const b = resolveBoundaries(nodes, args)
-      const startSeq = b.startSeq
-      const endSeq = b.endSeq
-      // 把 agent 编写的检查点交给引擎；被修补的 summarizer 消费它（一次性）
-      // 并完全跳过 LLM 调用。
-      {
-        const ext = ((engine as unknown as { _externalSummary?: Record<string, string> })._externalSummary ??= {})
-        ext[agent.session.id] = args.summary
+      if (nodes === null) return noChange('unavailable', 'sessionQuery unavailable; no history changed.')
+      const meter = resolveService(agent, 'tokenMeter') as Meter | undefined
+      if (!meter || typeof meter.measure !== 'function' || typeof meter.estimateMessage !== 'function') return noChange('unavailable', 'Authoritative token meter unavailable; no history changed.')
+      const callId = typeof (exec as { callId?: unknown }).callId === 'string' ? (exec as { callId: string }).callId : undefined
+      // Code Mode/PTC subcalls have synthetic IDs; only the root call is on the
+      // durable surface. Use root identity for active-tail checks, NEVER cleanup.
+      const rootCallId = (exec as { rootCallId?: unknown }).rootCallId
+      const boundaryCallId = typeof rootCallId === 'string' && rootCallId ? rootCallId : callId
+      if (!boundaryCallId) return noChange('unavailable', 'Active tool-call identity unavailable; refusing unsafe boundary selection.')
+      const cuts = {
+        before: (seq: number) => toolPairingBalancedBefore(agent.session as any, seq as any),
+        after: (seq: number) => toolPairingBalancedAfter(agent.session as any, seq as any),
       }
-
+      const route = () => JSON.stringify(agent.session.requestHeader?.()?.config ?? agent.options ?? {})
+      const routeKey = route()
+      const inspect = () => inspectSurface(nodes, cuts, meter, agent.session, boundaryCallId,
+        typeof args.afterSeq === 'number' && Number.isSafeInteger(args.afterSeq) ? args.afterSeq : -1,
+        typeof args.limit === 'number' && Number.isSafeInteger(args.limit) ? args.limit : 16)
+      if (action === 'inspect') return { ok: true, status: 'inspect', archived: null, ...inspect() }
+      let b: Region
+      try {
+        if (action === 'prepare') b = seqRegion(nodes, args.startSeq, args.endSeq, cuts, boundaryCallId)
+        else if (typeof args.planId === 'string') b = plans.resolve(agent.session, args.planId, nodes, routeKey, cuts,
+          r => selectionPrices(nodes, r, meter, agent.session), boundaryCallId)
+        else {
+          const legacy = resolveBoundaries(nodes, args)
+          b = seqRegion(nodes, legacy.startSeq, legacy.endSeq, cuts, boundaryCallId)
+        }
+      } catch (error) {
+        return { ...noChange(typeof args.planId === 'string' ? 'stale_plan' : 'needs_selection', String((error as Error).message)), ...inspect() }
+      }
+      const estimateFor = (current: SurfaceNode[], r: Region, summary?: string) => {
+        // Do not assume asynchronous cleanup will remove the submitted summary.
+        // Charge the whole current call node plus a result/locator allowance.
+        const measurement = meter.measure(agent.session)
+        const holder = current[activeCallPosition(current, boundaryCallId)]
+        const callCost = holder ? measurement.nodes.find(n => n.seq === holder.seq)?.tokens ?? 0 : 0
+        return benefit(sourcePrice(current, r, meter, agent.session), summary, meter,
+          config.minSourceTokens ?? MIN_SOURCE_TOKENS, config.minNetSavingsTokens ?? MIN_NET_SAVINGS_TOKENS,
+          callCost + 1024)
+      }
+      let estimate = estimateFor(nodes, b, action === 'compact' ? args.summary as string : undefined)
+      if (!estimate.useful) return { ...noChange('skipped', estimate.reason), estimate }
+      if (action === 'prepare') return { ok: true, status: 'ready', archived: null, estimate,
+        planId: plans.issue(agent.session, nodes, b, routeKey, selectionPrices(nodes, b, meter, agent.session)),
+        note: 'Write one complete checkpoint preserving necessary detail, then compact with this planId. Size estimates will be checked again including the submitted call; no semantic task completion is inferred.' }
+      const engine = resolveService(agent, 'compaction') as CompactionLike | undefined
+      if (!engine) return noChange('unavailable', 'Compaction engine unavailable; no history changed.')
+      const startSeq = b.startSeq, endSeq = b.endSeq
+      const preparedHash = fingerprint(nodes, b)
+      const preparedPrices = JSON.stringify(selectionPrices(nodes, b, meter, agent.session))
+      if (typeof args.planId === 'string') plans.consume(agent.session, args.planId)
       const spillStore = resolveService(agent, 'spillStore') as SpillStoreLike | undefined
       let archived: SurfaceArchive | null = null
       let archiveError: JsonValue | null = null
@@ -263,9 +329,23 @@ export function apply(ctx: Context, config: Config) {
         archiveError = 'spillStore unavailable; raw copy not saved (compaction still proceeds)'
       }
 
+      // Archival awaits may admit other events. Never apply a stale checkpoint.
+      const current = await readSurfaceNodes(agent)
+      if (!current || route() !== routeKey) return noChange('stale_plan', 'Surface or route changed during archive; inspect/prepare again.')
+      let checked: Region
+      try {
+        checked = seqRegion(current, startSeq, endSeq, cuts, boundaryCallId)
+        if (fingerprint(current, checked) !== preparedHash || JSON.stringify(selectionPrices(current, checked, meter, agent.session)) !== preparedPrices) {
+          return noChange('stale_plan', 'Selected span or token pricing changed during archive; no history replaced. Inspect/prepare again.')
+        }
+      } catch (error) { return noChange('stale_plan', String((error as Error).message)) }
+      estimate = estimateFor(current, checked, args.summary as string)
+      if (!estimate.useful) return { ...noChange('skipped', estimate.reason), estimate }
+      exec.signal?.throwIfAborted()
       let result: CompactionResultLike
       try {
-        result = await engine.compactRegion(startSeq, endSeq, agent, exec.signal)
+        result = await runWithExternalSummary(engine as unknown as OptimizedEngineLike, agent, args.summary as string,
+          () => engine.compactRegion(startSeq, endSeq, agent, exec.signal))
       } catch (err) {
         const msg = err && (err as Error).message ? (err as Error).message : String(err)
         throw new Error('compaction rejected range [' + startSeq + ',' + endSeq + ']: ' + msg)
@@ -274,9 +354,8 @@ export function apply(ctx: Context, config: Config) {
       // 成对清理：检查点是单独注入的，为避免检查点文本在 surface 出现两次，
       // 将该 tool-call 的 assistant/message 与其 tool/result 各 shadow 为一个
       // 占位符（仅当该消息恰好只含这一个 tool-call 时才安全）。
-      const callId = (exec as { callId?: unknown }).callId
       if (typeof callId === 'string' && callId) {
-        const holder = nodes.filter((n) => soleToolCall(n, callId)).pop()
+        const holder = current.filter((n) => soleToolCall(n, callId) && pureCompactionCall(n)).pop()
         const assistantSeq = holder ? holder.seq : undefined
         if (assistantSeq !== undefined && assistantSeq > endSeq) {
           const sid = agent.session.id
@@ -305,7 +384,7 @@ export function apply(ctx: Context, config: Config) {
                   // 把归档定位符写进完成消息（承载它的 tool/result 随后被 shadow）。
                   const locText = archived && archived.locator ? String(archived.locator) : ''
                   const freedText = result.shadowedTokenCount !== undefined && result.shadowedTokenCount !== null
-                    ? '; freed ~' + String(result.shadowedTokenCount) + ' tokens'
+                    ? '; replaced ~' + String(result.shadowedTokenCount) + ' source tokens (gross, not net savings)'
                     : ''
                   const doneText = '`context_compact` done: checkpoint above' + freedText + (locText
                     ? '; raw span archived at ' + locText + '.'
@@ -334,13 +413,17 @@ export function apply(ctx: Context, config: Config) {
         }
       }
       // 调试指标只进日志，不进入模型可见的工具结果。
-      ctx.logger.info('[context_compact] %s span %d..%d (%s), shadowed %d nodes / %s tokens, surface %d -> after, usage=%o', agent.session.id, startSeq, endSeq, b.method, Array.isArray(result.shadowedSeqs) ? result.shadowedSeqs.length : 0, String(result.shadowedTokenCount ?? '?'), nodes.length, usage)
+      ctx.logger.info('[context_compact] %s span %d..%d (%s), shadowed %d nodes / %s tokens, surface %d -> after, usage=%o', agent.session.id, startSeq, endSeq, typeof args.planId === 'string' ? 'prepared-seq' : 'legacy-anchor', Array.isArray(result.shadowedSeqs) ? result.shadowedSeqs.length : 0, String(result.shadowedTokenCount ?? '?'), nodes.length, usage)
       const out: {
         ok: boolean
+        status: string
+        estimate: ReturnType<typeof benefit>
         archived: { locator: JsonValue; retrievalHint: JsonValue } | null
         archiveError?: string
       } = {
         ok: true,
+        status: 'compacted',
+        estimate,
         archived: archived ? {
           locator: archived.locator,
           retrievalHint: archived.retrievalHint,
@@ -348,6 +431,9 @@ export function apply(ctx: Context, config: Config) {
       }
       if (archiveError) out.archiveError = typeof archiveError === 'string' ? archiveError : String(archiveError)
       return out
+      } finally {
+        if (action === 'compact') compacting.delete(agent.session.id)
+      }
     },
   })))
 

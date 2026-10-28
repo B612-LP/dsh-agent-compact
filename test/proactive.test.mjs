@@ -137,7 +137,7 @@ function harness() {
 
 test('same-assembly registered context has absolute bands, even without model metadata', async () => {
   const h = harness()
-  assert.match(h.text(), /v0.2.4\/pressure/)
+  assert.match(h.text(), /v0.2.5\/pressure/)
   assert.match(h.text(), /notice at 250k, continuous maintenance at 300k/)
   const assembly = await h.prepare()
   assert.equal(assembly.contexts[0].text, 'preserve me')
@@ -156,7 +156,7 @@ test('no summary-event baseline reset can silence still-high pressure', async ()
   h.setNow(301076)
   assert.match(h.text(), /partial compaction does not clear/)
   h.setNow(260000)
-  assert.match(h.text(), /v0.2.4\/pressure/)
+  assert.match(h.text(), /v0.2.5\/pressure/)
   h.setNow(249999)
   assert.equal(h.text(), '')
 })
@@ -167,7 +167,7 @@ test('route switch preserves absolute cycle but never reuses old metadata or GUI
   h.text()
   h.setHeader({ config: { provider: 'test', model: 'other', maxTokens: 32768 } })
   h.setNow(280000)
-  assert.match(h.text(), /v0.2.4\/pressure/)
+  assert.match(h.text(), /v0.2.5\/pressure/)
   assert.doesNotMatch(h.text(), /[Oo]fficial fallback limit/)
   h.services.llm = { resolveModelInfo: async () => ({ context: { contextWindow: 1000000 }, defaultMaxTokens: 32768 }) }
   await h.prepare()
@@ -180,7 +180,7 @@ test('metadata lookup failure does not block the assembly or absolute 300k maint
   h.services.llm = { resolveModelInfo: async () => { throw new Error('offline metadata') } }
   const assembly = await h.prepare()
   assert.equal(assembly.contexts[0].text, 'preserve me')
-  assert.match(assembly.contexts[1].text, /v0.2.4\/pressure/)
+  assert.match(assembly.contexts[1].text, /v0.2.5\/pressure/)
   assert.doesNotMatch(h.text(), /[Oo]fficial fallback limit/)
 })
 
@@ -195,7 +195,7 @@ test('two presets with identical route names retain independent LLM metadata', a
   for (const agent of [a, b, a, b, a]) {
     h.setAgent(agent)
     const assembly = await h.prepare()
-    assert.match(assembly.contexts[1].text, /v0.2.4\/notice/)
+    assert.match(assembly.contexts[1].text, /v0.2.5\/notice/)
     assert.match(assembly.contexts[1].text, agent === a ? /limit ~400k/ : /limit ~800k/)
   }
 })
@@ -209,7 +209,7 @@ test('expired metadata outage retains matching cached safety budget', async () =
   h.services.llm.resolveModelInfo = async () => { throw new Error('temporary outage') }
   try {
     assert.match((await h.prepare()).contexts[1].text, /[Oo]fficial fallback limit ~400k/)
-    assert.match(h.text(), /v0.2.4\/pressure/)
+    assert.match(h.text(), /v0.2.5\/pressure/)
   } finally { Date.now = originalNow }
 })
 
@@ -217,7 +217,7 @@ test('broken optional projection cannot hide a working meter', async () => {
   const h = harness()
   h.services.sessionProjections.snapshot = () => { throw new Error('broken projection') }
   await h.prepare()
-  assert.match(h.text(), /v0.2.4\/pressure/)
+  assert.match(h.text(), /v0.2.5\/pressure/)
 })
 
 test('real Cordis + SystemPrompt includes same-assembly and admission hints with runtime context disabled', async () => {
@@ -234,7 +234,7 @@ test('real Cordis + SystemPrompt includes same-assembly and admission hints with
   try {
     const assembly = await prompt.assemble({})
     const hint = assembly.contexts.find(c => c.name === 'agent-compact:volume-nudge')
-    assert.match(hint.text, /v0.2.4\/pressure/)
+    assert.match(hint.text, /v0.2.5\/pressure/)
     assert.match(hint.text, /notice at 250k, continuous maintenance at 300k/)
     assert.match(hint.text, /[Oo]fficial fallback limit ~400k/)
     const refreshed = prompt.refreshContext(assembly, {})
@@ -248,4 +248,17 @@ test('guidance protects detail and active spans without vetoing unrelated finish
   assert.match(COMPACTION_GUIDANCE, /one concluded sub-task per call/)
   assert.match(COMPACTION_GUIDANCE, /absolute token occupancy/)
   assert.doesNotMatch(COMPACTION_GUIDANCE, /evaluate only when a nudge appears/)
+})
+
+test('assembly upgrades stale sid summary caches before official fallback even without a tool call', async () => {
+  const h=harness()
+  h.services.compaction._externalSummary={ [h.session.id]: 'stale checkpoint from old failed operation' }
+  h.services.compaction.summarize=async function(_input, agent) {
+    return this._externalSummary?.[agent.session.id] ?? 'official'
+  }
+  h.setNow(1000) // Even quiet sessions must discard the obsolete injected cache.
+  assert.equal(h.text(),'')
+  assert.equal(h.services.compaction._externalSummary,undefined)
+  assert.equal(await h.services.compaction.summarize({}, {session:h.session}),'official')
+  h.dispose()
 })

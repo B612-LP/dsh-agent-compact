@@ -94,14 +94,17 @@ test('resolveBoundaries: resolved start after resolved end is rejected', () => {
   )
 })
 
-test('resolveBoundaries: end anchor on a tool-calling turn snaps forward through its tool/result', () => {
+test('resolveBoundaries: pure tool arguments are not anchors; actual prose still balances its result', () => {
+  const call = assistantToolCallNode(2, 'call-1', 'run_tests', '{}')
   const nodes = [
     userNode(1, 'run the tests'),
-    assistantToolCallNode(2, 'call-1', 'run_tests', '{}'),
+    call,
     toolResultNode(3, 'all green'),
     userNode(4, 'great, ship it'),
   ]
-  const b = resolveBoundaries(nodes, { endAnchor: '[tool-call run_tests]' })
+  assert.throws(() => resolveBoundaries(nodes, { endAnchor: '[tool-call run_tests]' }), /not found/)
+  call.data.message.content.unshift({ type: 'text', text: 'Testing the finished implementation' })
+  const b = resolveBoundaries(nodes, { endAnchor: 'Testing the finished implementation' })
   // 终点吸附穿过了紧随其后的 tool/result（seq 3），而不是停在发起调用的
   // assistant/message（seq 2）——否则区间会留下一个没有其调用者的孤立结果。
   assert.equal(b.endSeq, 3)

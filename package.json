@@ -1,6 +1,6 @@
 {
   "name": "@mimichunterz/agent-compact",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "description": "Context compression tool (context_compact): the agent writes the replacement checkpoint itself and hands it to the host compaction engine, which skips the LLM summarizer call; automatic compaction stays on the official engine.",
   "type": "module",
   "main": "./lib/index.js",
@@ -65,6 +65,7 @@
     "zod": "4.4.3"
   },
   "peerDependencies": {
+    "@deepseek-ai/dsh-compaction": "0.2.1-rc.3",
     "@deepseek-ai/dsh-compaction-basic": "0.2.1-rc.3",
     "@deepseek-ai/dsh-llm": "^0.2.1-rc.3",
     "@deepseek-ai/dsh-tools": "^0.2.1-rc.3",
