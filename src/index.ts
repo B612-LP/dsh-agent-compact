@@ -39,8 +39,8 @@ export const Config: Schema<Config> = Schema.object({
   minSourceTokens: Schema.number().min(1).default(MIN_SOURCE_TOKENS).description('Minimum route-priced source span for compaction (default 4096). Smaller completed tasks stay intact; never discard detail or combine live/unrelated tasks to pass this guard.'),
   minNetSavingsTokens: Schema.number().min(1).default(MIN_NET_SAVINGS_TOKENS).description('Minimum estimated net reduction after checkpoint framing, current tool-call cost and result/cleanup reserves (default 2048). Estimates are not exact provider savings.'),
   autoArchive: Schema.boolean().default(true).description('context_compact saves the full raw span to a spill artifact before replacing it.'),
-  volumeNudgeTokens: Schema.number().min(0).default(300000).description('Absolute current-occupancy bands: notice from 5/6 of this amount (default 250k), continuous maintenance from this amount (300k). Once continuous, keep prompting until below the notice band. Not growth since compaction or a percentage of context capacity. 0 disables these quality bands.'),
-  autoSafetyMarginTokens: Schema.number().min(0).default(65536).description('Secondary overflow guard: also warn this many tokens before the routed official auto-compaction threshold; capped for very small models. Does not scale or postpone the absolute 250k/300k quality bands.'),
+  volumeNudgeTokens: Schema.number().min(0).default(300000).description('Absolute current-occupancy quality threshold (default 300k). No earlier quality notice: maintenance starts at this amount and stops below it. Not growth since compaction or a percentage of context capacity. 0 disables quality maintenance; the independent overflow guard remains.'),
+  autoSafetyMarginTokens: Schema.number().min(0).default(65536).description('Secondary overflow guard: also warn this many tokens before the routed official auto-compaction threshold; capped for very small models. Independent of the absolute 300k quality threshold; small routes may need earlier overflow protection.'),
 })
 
 export function apply(ctx: Context, config: Config) {

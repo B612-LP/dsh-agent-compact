@@ -38,19 +38,26 @@ test('unknown capacity, route or backend never fabricates an official threshold'
   assert.equal(automaticBudget(policy, { ...route, maxTokens: 500000 }, info, defaults), null)
 })
 
-test('250k is the absolute notice boundary, not a percentage or accumulated growth', () => {
-  const state = fresh()
-  assert.equal(evaluateNudge(249999, null, state, 300000), 'quiet')
-  assert.equal(evaluateNudge(250000, null, state, 300000), 'notice')
-  assert.equal(evaluateNudge(299999, null, state, 300000), 'notice')
-  assert.equal(evaluateNudge(300000, null, state, 300000), 'pressure')
+test('quality stays quiet at every occupancy 0..299999, including previously active state; 300000 triggers', () => {
+  for (let now = 0; now < 300000; now++) {
+    assert.equal(evaluateNudge(now, null, fresh(), 300000), 'quiet')
+    const state = fresh()
+    assert.equal(evaluateNudge(300000, null, state, 300000), 'pressure')
+    assert.equal(evaluateNudge(now, null, state, 300000), 'quiet')
+    assert.equal(state.pressureActive, false)
+  }
+  assert.equal(evaluateNudge(300000, null, fresh(), 300000), 'pressure')
 })
 
-test('500k and 1M windows use identical 250k notice and 300k continuous quality bands', () => {
+test('500k and 1M windows use the identical absolute 300000 quality threshold', () => {
   const big = automaticBudget(policy, route, { ...info, context: { contextWindow: 1000000 } }, defaults)
   for (const b of [budget(), big, null]) {
-    assert.equal(evaluateNudge(250000, b, fresh(), 300000), 'notice')
-    assert.equal(evaluateNudge(300000, b, fresh(), 300000), 'pressure')
+    const state = fresh()
+    assert.equal(evaluateNudge(300000, b, state, 300000), 'pressure')
+    for (const now of [299999, 280000, 260000, 250000, 249999, 0]) {
+      assert.equal(evaluateNudge(now, b, state, 300000), 'quiet')
+    }
+    assert.equal(evaluateNudge(300000, b, state, 300000), 'pressure')
   }
 })
 
@@ -63,7 +70,8 @@ test('58,924-token partial reduction does not silence still-full current occupan
   const state = fresh()
   assert.equal(evaluateNudge(360000, null, state, 300000), 'pressure')
   assert.equal(evaluateNudge(301076, null, state, 300000), 'pressure')
-  assert.equal(evaluateNudge(260000, null, state, 300000), 'pressure')
+  assert.equal(evaluateNudge(299999, null, state, 300000), 'quiet')
+  assert.equal(evaluateNudge(260000, null, state, 300000), 'quiet')
   assert.equal(evaluateNudge(249999, null, state, 300000), 'quiet')
 })
 
@@ -74,8 +82,9 @@ test('restart above 300k immediately re-arms without needing any compaction hist
 test('metadata loss does not disable absolute maintenance', () => {
   const state = fresh()
   assert.equal(evaluateNudge(310000, budget(), state, 300000), 'pressure')
-  assert.equal(evaluateNudge(280000, null, state, 300000), 'pressure')
-  assert.equal(evaluateNudge(280000, budget(), state, 300000), 'pressure')
+  assert.equal(evaluateNudge(280000, null, state, 300000), 'quiet')
+  assert.equal(evaluateNudge(280000, budget(), state, 300000), 'quiet')
+  assert.equal(evaluateNudge(300000, null, state, 300000), 'pressure')
 })
 
 test('small models still have an earlier secondary overflow guard', () => {
@@ -93,7 +102,7 @@ test('lost overflow budget cannot falsely clear an active safety cycle', () => {
   assert.equal(evaluateNudge(300000, budget(), state, 300000), 'pressure')
 })
 
-test('disabling quality bands leaves the secondary overflow guard intact', () => {
+test('disabling the quality threshold leaves the secondary overflow guard intact', () => {
   assert.equal(evaluateNudge(310000, null, fresh(), 0), 'quiet')
   assert.equal(evaluateNudge(350000, budget(), fresh(), 0), 'urgent')
 })
@@ -135,10 +144,10 @@ function harness() {
     setNow: n => { now = n }, setHeader: v => { header = v }, setAgent: v => { agent = v } }
 }
 
-test('same-assembly registered context has absolute bands, even without model metadata', async () => {
+test('same-assembly registered context has an absolute threshold, even without model metadata', async () => {
   const h = harness()
-  assert.match(h.text(), /v0.2.6\/pressure/)
-  assert.match(h.text(), /notice at 250k, continuous maintenance at 300k/)
+  assert.match(h.text(), /v0.2.7\/pressure/)
+  assert.match(h.text(), /maintenance at 300k/)
   const assembly = await h.prepare()
   assert.equal(assembly.contexts[0].text, 'preserve me')
   assert.match(assembly.contexts[1].text, /[Oo]fficial fallback limit ~400k/)
@@ -155,24 +164,28 @@ test('no summary-event baseline reset can silence still-high pressure', async ()
   assert.equal(h.listeners.has('session/event'), false)
   h.setNow(301076)
   assert.match(h.text(), /partial compaction does not clear/)
+  h.setNow(299999)
+  assert.equal(h.text(), '')
   h.setNow(260000)
-  assert.match(h.text(), /v0.2.6\/pressure/)
+  assert.equal(h.text(), '')
   h.setNow(249999)
   assert.equal(h.text(), '')
 })
 
-test('route switch preserves absolute cycle but never reuses old metadata or GUI capacity', async () => {
+test('route switch re-evaluates absolute occupancy but never reuses old metadata or GUI capacity', async () => {
   const h = harness()
   await h.prepare()
   h.text()
   h.setHeader({ config: { provider: 'test', model: 'other', maxTokens: 32768 } })
   h.setNow(280000)
-  assert.match(h.text(), /v0.2.6\/pressure/)
+  assert.equal(h.text(), '')
+  h.setNow(300000)
+  assert.match(h.text(), /v0.2.7\/pressure/)
   assert.doesNotMatch(h.text(), /[Oo]fficial fallback limit/)
   h.services.llm = { resolveModelInfo: async () => ({ context: { contextWindow: 1000000 }, defaultMaxTokens: 32768 }) }
   await h.prepare()
   assert.match(h.text(), /[Oo]fficial fallback limit ~800k/)
-  assert.match(h.text(), /notice at 250k, continuous maintenance at 300k/)
+  assert.match(h.text(), /maintenance at 300k/)
 })
 
 test('metadata lookup failure does not block the assembly or absolute 300k maintenance', async () => {
@@ -180,7 +193,7 @@ test('metadata lookup failure does not block the assembly or absolute 300k maint
   h.services.llm = { resolveModelInfo: async () => { throw new Error('offline metadata') } }
   const assembly = await h.prepare()
   assert.equal(assembly.contexts[0].text, 'preserve me')
-  assert.match(assembly.contexts[1].text, /v0.2.6\/pressure/)
+  assert.match(assembly.contexts[1].text, /v0.2.7\/pressure/)
   assert.doesNotMatch(h.text(), /[Oo]fficial fallback limit/)
 })
 
@@ -191,11 +204,11 @@ test('two presets with identical route names retain independent LLM metadata', a
   const llms = { a: { resolveModelInfo: async () => info },
     b: { resolveModelInfo: async () => ({ ...info, context: { contextWindow: 1000000 } }) } }
   h.services.agentPresets = { serviceFor: ({ ctx }, name) => name === 'llm' ? llms[ctx.name] : undefined }
-  h.setNow(260000)
+  h.setNow(300000)
   for (const agent of [a, b, a, b, a]) {
     h.setAgent(agent)
     const assembly = await h.prepare()
-    assert.match(assembly.contexts[1].text, /v0.2.6\/notice/)
+    assert.match(assembly.contexts[1].text, /v0.2.7\/pressure/)
     assert.match(assembly.contexts[1].text, agent === a ? /limit ~400k/ : /limit ~800k/)
   }
 })
@@ -209,7 +222,7 @@ test('expired metadata outage retains matching cached safety budget', async () =
   h.services.llm.resolveModelInfo = async () => { throw new Error('temporary outage') }
   try {
     assert.match((await h.prepare()).contexts[1].text, /[Oo]fficial fallback limit ~400k/)
-    assert.match(h.text(), /v0.2.6\/pressure/)
+    assert.match(h.text(), /v0.2.7\/pressure/)
   } finally { Date.now = originalNow }
 })
 
@@ -217,7 +230,7 @@ test('broken optional projection cannot hide a working meter', async () => {
   const h = harness()
   h.services.sessionProjections.snapshot = () => { throw new Error('broken projection') }
   await h.prepare()
-  assert.match(h.text(), /v0.2.6\/pressure/)
+  assert.match(h.text(), /v0.2.7\/pressure/)
 })
 
 test('real Cordis + SystemPrompt includes same-assembly and admission hints with runtime context disabled', async () => {
@@ -234,8 +247,8 @@ test('real Cordis + SystemPrompt includes same-assembly and admission hints with
   try {
     const assembly = await prompt.assemble({})
     const hint = assembly.contexts.find(c => c.name === 'agent-compact:volume-nudge')
-    assert.match(hint.text, /v0.2.6\/pressure/)
-    assert.match(hint.text, /notice at 250k, continuous maintenance at 300k/)
+    assert.match(hint.text, /v0.2.7\/pressure/)
+    assert.match(hint.text, /maintenance at 300k/)
     assert.match(hint.text, /[Oo]fficial fallback limit ~400k/)
     const refreshed = prompt.refreshContext(assembly, {})
     assert.match(refreshed.contexts.find(c => c.name === hint.name).text, /proactive maintenance/)
