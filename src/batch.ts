@@ -7,7 +7,7 @@ import type { SurfaceNode } from './optimizer.js'
 
 export interface BatchRange { startSeq: number; endSeq: number; summary: string }
 export interface BatchSelection extends BatchRange { region: Region; digest: string; prices: string }
-interface Scan { until: number; route: string; nodes: { seq: number; hash: string; tokens: number }[] }
+interface Scan { route: string; nodes: { seq: number; hash: string; tokens: number }[] }
 function nodeHash(n: SurfaceNode) {
   return createHash('sha256').update(JSON.stringify([n.seq, n.type, n.data])).digest('hex')
 }
@@ -17,23 +17,23 @@ export function batchFingerprint(nodes: SurfaceNode[], r: Region) {
 }
 export class BatchScans {
   private readonly sessions = new WeakMap<object, Map<string, Scan>>()
-  constructor(private readonly clock = Date.now) {}
   issue(session: object, nodes: SurfaceNode[], route: string, meter: Meter, callId: string) {
     let scans = this.sessions.get(session)
     if (!scans) { scans = new Map(); this.sessions.set(session, scans) }
-    for (const [id, scan] of scans) if (scan.until <= this.clock()) scans.delete(id)
+    // Drafting a complete checkpoint may take arbitrarily long. Bound retained
+    // snapshots by count, not elapsed time; resolve revalidates each selection.
     while (scans.size >= 2) scans.delete(scans.keys().next().value!)
     const prices = new Map(meter.measure(session).nodes.map(n => [n.seq, n.tokens]))
     const closed = nodes.slice(0, activeCallPosition(nodes, callId))
     const id = randomUUID()
-    scans.set(id, { until: this.clock() + 10 * 60 * 1000, route,
+    scans.set(id, { route,
       nodes: closed.map(n => ({ seq: n.seq, hash: nodeHash(n), tokens: prices.get(n.seq) ?? NaN })) })
     return id
   }
   resolve(session: object, id: string, nodes: SurfaceNode[], route: string, cuts: Cuts,
     meter: Meter, callId: string, ranges: unknown): BatchSelection[] {
     const scan = this.sessions.get(session)?.get(id)
-    if (!scan || scan.until <= this.clock() || scan.route !== route) throw new Error('Scan missing, expired or route changed; inspect once again before a new batch.')
+    if (!scan || scan.route !== route) throw new Error('Scan missing, evicted or route changed; inspect once again before a new batch.')
     if (!Array.isArray(ranges) || !ranges.length || ranges.length > 200) throw new Error('Supply 1..200 selected ranges from the scan, each with a complete summary.')
     const positions = new Map(scan.nodes.map((n, i) => [n.seq, i]))
     const selections = ranges.map((value: unknown): BatchSelection => {

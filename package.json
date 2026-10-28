@@ -1,6 +1,6 @@
 {
   "name": "@mimichunterz/agent-compact",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Two-call context maintenance: inspect once, batch all selected completed spans without per-range size/savings gates; safe async checkpoint injection, raw archives and idempotent receipts.",
   "type": "module",
   "main": "./lib/index.js",

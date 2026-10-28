@@ -204,7 +204,9 @@ export function apply(ctx: Context, config: Config) {
   const disposers: (() => void)[] = []
   const plans = new CompactionPlans()
   const scans = new BatchScans()
-  const batchReceipts = new WeakMap<object, Map<string, { until: number; signature: string; value: any }>>()
+  // Bounded receipts survive drafting delays just like scans; content and payload
+  // identities, not elapsed time, decide whether an old handle is safe to use.
+  const batchReceipts = new WeakMap<object, Map<string, { signature: string; value: any }>>()
   const compacting = new Set<string>()
   const receipts = new WeakMap<object, Map<string, { until: number; value: any }>>()
 
@@ -212,7 +214,7 @@ export function apply(ctx: Context, config: Config) {
 
   disposers.push(tools.register(defineTool({
     name: 'context_compact',
-    description: 'Two-call maintenance: (1) inspect once for the complete closed-surface candidate index and scanId; (2) compact with scanId+ranges to checkpoint ALL selected completed content in one batch tool call. No mandatory prepare, minimum span size or net-savings gate: small members may participate. A range may cover multiple contiguous completed topics; disjoint ranges preserve their intervening live gaps. Preserve exact user requirements/corrections, necessary paths/IDs, decisions, evidence, risks and next steps; do not include unfinished work. Structural range candidates are not automatic semantic-completion judgments: choose using the conversation already in context. Inspect coverage reports omissions explicitly; focused reads are optional when genuinely needed, not a routine scanning chain. Each batch member has observed startSeq/endSeq and its complete Markdown summary. All members validate before mutation; host commits run serially under one lock. Partial failures return per-member receipts: never repeat already committed members. scanId alone replays the batch receipt. Legacy single-span/prepare calls remain supported, without size/savings rejection. Raw spans are archived; current call and open tool steps cannot be selected.',
+    description: 'Two-call maintenance: (1) inspect once for the complete closed-surface candidate index and scanId; (2) compact with scanId+ranges to checkpoint ALL selected completed content in one batch tool call. No mandatory prepare, minimum span size or net-savings gate: small members may participate. A range may cover multiple contiguous completed topics; disjoint ranges preserve their intervening live gaps. Preserve exact user requirements/corrections, necessary paths/IDs, decisions, evidence, risks and next steps; do not include unfinished work. Structural range candidates are not automatic semantic-completion judgments: choose using the conversation already in context. Inspect coverage reports omissions explicitly; focused reads are optional when genuinely needed, not a routine scanning chain. Write each complete continuation checkpoint once, not an exhaustive release history or chronology; consolidate repeated summaries and retain historical details/IDs only when still necessary. Reuse unchanged summary text on safe retries. Each batch member has observed startSeq/endSeq and its Markdown summary. All members validate before mutation; host commits run serially under one lock. Partial failures return per-member receipts: never repeat already committed members. scanId alone replays the batch receipt. Legacy single-span/prepare calls remain supported, without size/savings rejection. Raw spans are archived; current call and open tool steps cannot be selected.',
     parameters: {
       action: { type: 'string', enum: ['inspect', 'prepare', 'compact'], description: 'inspect is read-only and creates a batch scan; compact with scanId+ranges commits all selected members. prepare is optional legacy-only, not part of the normal two-call path. Defaults to compact for legacy calls.' },
       mode: { type: 'string', enum: ['batch', 'overview', 'search', 'detail', 'messages'], description: 'inspect defaults to one-pass batch discovery across the closed surface. Other modes are legacy/focused reads; use them only when genuinely necessary, not as a mandatory preparation chain.' },
@@ -225,12 +227,12 @@ export function apply(ctx: Context, config: Config) {
       startAnchor: { type: 'string', description: 'Verbatim opening of the span\'s first message. Required for a middle span; omitting starts at the conversation\'s first message, discarding opening requirements and direction — only for compressing all history up to endAnchor or rebaselining.' },
       endAnchor: { type: 'string', description: 'Verbatim opening of the span\'s last message; required. This node is replaced — pass its predecessor\'s opening to keep it.' },
       summary: { type: 'string', description: 'Legacy single-span complete Markdown checkpoint. For batches put one complete summary in each ranges member. Never send with inspect.' },
-      scanId: { type: 'string', description: 'From the first inspect; pass with all selected ranges in the second call. Session-bound, expires in 10 minutes. Alone replays a completed batch receipt without resubmitting summaries.' },
+      scanId: { type: 'string', description: 'From the first inspect; pass with all selected ranges in the second call. Session-bound, latest 2 scans retained, no wall-clock expiry. Content/route/structure are revalidated; reloads/eviction invalidate handles. Alone replays a cached batch receipt (latest 4) without resubmitting summaries.' },
       ranges: { type: 'array', description: 'compact batch: all selected concluded ranges together, including small members. No prepare or source/net gate. Retained gaps are never widened or removed.', items: {
         type: 'object', additionalProperties: false, properties: {
           startSeq: { type: 'integer', required: true, description: 'Observed legal start ID, including disclosed balanced tool-step calls.' },
           endSeq: { type: 'integer', required: true, description: 'Observed inclusive closed end ID, before the current call.' },
-          summary: { type: 'string', required: true, description: 'Complete replacement checkpoint for this member; preserve exact requirements, evidence, active dependencies and next steps.' },
+          summary: { type: 'string', required: true, description: 'Complete current continuation state, without redundant retelling; preserve current requirements/corrections verbatim and still-needed dependencies, evidence, risks and next steps.' },
         },
       } },
     },
@@ -311,7 +313,7 @@ export function apply(ctx: Context, config: Config) {
     }
     if (typeof args.scanId !== 'string' || !args.scanId) return fail('needs_selection', 'Inspect once to obtain scanId, then submit all selected ranges together.')
     const prior = batchReceipts.get(agent.session)?.get(args.scanId)
-    if (prior && prior.until > Date.now()) {
+    if (prior) {
       if (args.ranges !== undefined && JSON.stringify(args.ranges) !== prior.signature) return fail('needs_selection', 'This scan already has a batch receipt for a different payload. Do not replay changed summaries against it; inspect a new scan.')
       const nodes = await readSurfaceNodes(agent)
       if (nodes) cleanupBatchCall(agent, nodes, typeof exec.callId === 'string' ? exec.callId : undefined, prior.value)
@@ -365,9 +367,8 @@ export function apply(ctx: Context, config: Config) {
           : 'Batch stopped at an unsuccessful or uncertain member. Committed members remain committed; not_attempted members are untouched. An outcome_unknown member requires durable-evidence inspection before retry. This is not an all-or-nothing host transaction; never blindly repeat completed ranges.' }
       let saved = batchReceipts.get(agent.session)
       if (!saved) { saved = new Map(); batchReceipts.set(agent.session, saved) }
-      for (const [id, record] of saved) if (record.until <= Date.now()) saved.delete(id)
       while (saved.size >= 4) saved.delete(saved.keys().next().value!)
-      saved.set(args.scanId, { until: Date.now() + 10 * 60 * 1000, signature: JSON.stringify(args.ranges), value: out })
+      saved.set(args.scanId, { signature: JSON.stringify(args.ranges), value: out })
       cleanupBatchCall(agent, nodes, callId, out)
       return out
     } finally { compacting.delete(agent.session.id) }

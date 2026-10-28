@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { Context } from '@deepseek-ai/cordis'
 import { apply } from '../lib/index.js'
+import { BatchScans } from '../lib/batch.js'
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 
 const user=(seq,text,tokens=3000)=>({seq,type:'user/message',data:{role:'user',content:[{type:'text',text}]},tokens})
@@ -32,6 +33,58 @@ function harness(){
 }
 const ranges=[{startSeq:20,endSeq:21,summary:'## A\nCompleted A, exact evidence retained.'},{startSeq:40,endSeq:41,summary:'## B\nCompleted B, exact evidence retained.'}]
 
+test('unchanged inspected batches still commit after 13 minutes and more than 24 hours',async t=>{
+ let now=Date.now();t.mock.method(Date,'now',()=>now)
+ for(const delay of [13*60*1000,25*60*60*1000]){
+  const h=harness();try{
+   const view=await h.run({action:'inspect'});now+=delay
+   const result=await h.run({action:'compact',scanId:view.scanId,ranges})
+   assert.equal(result.status,'compacted');assert.equal(h.commits,2);assert.equal(h.archives,2)
+   for(const range of ranges)assert.ok(h.nodes.some(n=>n.data.content?.[0]?.text===range.summary),'complete summary is preserved')
+  }finally{h.dispose()}
+ }
+})
+test('long-lived scans still reject wrong sessions, routes, IDs, changed content and lost contiguity',t=>{
+ let now=Date.now();t.mock.method(Date,'now',()=>now)
+ const h=harness(),scans=new BatchScans(),cuts={before:()=>true,after:()=>true}
+ const resolve=(id,session=h.session,route='fixed',boundaries=cuts)=>scans.resolve(session,id,h.nodes,route,boundaries,h.meter,'active',ranges)
+ try{
+  const id=scans.issue(h.session,h.nodes,'fixed',h.meter,'active');now+=25*60*60*1000
+  assert.equal(resolve(id).length,2)
+  assert.throws(()=>resolve(id,{id:h.session.id}),/Scan missing/)
+  assert.throws(()=>resolve(id,h.session,'changed-route'),/route changed/)
+  assert.throws(()=>resolve('unknown-scan'),/Scan missing/)
+  const node=h.nodes.find(n=>n.seq===40),text=node.data.content[0].text
+  node.data.content[0].text='changed after long drafting delay'
+  assert.throws(()=>resolve(id),/content changed/);node.data.content[0].text=text
+  const index=h.nodes.findIndex(n=>n.seq===41)
+  h.nodes.splice(index,0,user(45,'inserted inside selected range'))
+  assert.throws(()=>resolve(id),/no longer contiguous/);h.nodes.splice(index,1)
+  h.nodes[index].seq=42
+  assert.throws(()=>resolve(id),/boundary no longer exists/);h.nodes[index].seq=41
+  assert.throws(()=>resolve(id,h.session,'fixed',{before:()=>false,after:()=>true}),/open tool-call/)
+  assert.equal(resolve(id).length,2)
+  assert.equal(h.archives+h.commits,0)
+ }finally{h.dispose()}
+})
+test('scan retention stays bounded to the newest two per session without time-based eviction',t=>{
+ let now=Date.now();t.mock.method(Date,'now',()=>now)
+ const h=harness(),scans=new BatchScans(),cuts={before:()=>true,after:()=>true}
+ const issue=session=>scans.issue(session,h.nodes,'fixed',h.meter,'active')
+ const resolve=(id,session=h.session)=>scans.resolve(session,id,h.nodes,'fixed',cuts,h.meter,'active',ranges)
+ try{
+  const first=issue(h.session);now+=25*60*60*1000
+  const second=issue(h.session)
+  assert.equal(resolve(first).length,2);assert.equal(resolve(second).length,2)
+  const other={id:h.session.id};for(let i=0;i<3;i++)issue(other)
+  assert.equal(resolve(first).length,2);assert.equal(resolve(second).length,2)
+  const third=issue(h.session)
+  assert.throws(()=>resolve(first),/Scan missing, evicted/)
+  assert.equal(resolve(second).length,2);assert.equal(resolve(third).length,2)
+  assert.throws(()=>resolve(third,other),/Scan missing/)
+ }finally{h.dispose()}
+})
+
 test('one inspect then one batch compact commits multiple 3000-token members, retains live gaps and counts call once',async()=>{
  const h=harness()
  try{
@@ -44,6 +97,37 @@ test('one inspect then one batch compact commits multiple 3000-token members, re
   assert.equal(h.nodes.filter(n=>[20,21,40,41].includes(n.seq)).length,0)
   const replay=await h.run({action:'compact',scanId:view.scanId});assert.equal(replay.status,'already_compacted');assert.equal(h.commits,2)
   const changed=await h.run({action:'compact',scanId:view.scanId,ranges:[{...ranges[0],summary:'changed'}]});assert.equal(changed.status,'needs_selection');assert.equal(h.commits,2)
+ }finally{h.dispose()}
+})
+test('late success, partial and unknown receipt replays preserve outcomes without repeating attempts',async t=>{
+ let now=Date.now();t.mock.method(Date,'now',()=>now)
+ for(const mode of ['success','partial','unknown']){
+  const h=harness();if(mode==='partial')h.failAt=2
+  if(mode==='unknown')h.commitHook=async()=>{throw Error('committed then transport failed')}
+  try{
+   const view=await h.run({action:'inspect'}),out=await h.run({scanId:view.scanId,ranges})
+   const counts=[h.attempts,h.commits,h.archives];now+=25*60*60*1000
+   const replay=await h.run({scanId:view.scanId})
+   assert.equal(replay.status,mode==='success'?'already_compacted':out.status)
+   assert.deepEqual(replay.results,out.results);assert.deepEqual(replay.estimate,out.estimate)
+   assert.deepEqual([h.attempts,h.commits,h.archives],counts)
+   const changed=await h.run({scanId:view.scanId,ranges:[{...ranges[0],summary:'changed after delay'}]})
+   assert.equal(changed.status,'needs_selection');assert.deepEqual([h.attempts,h.commits,h.archives],counts)
+  }finally{h.dispose()}
+ }
+})
+test('batch receipt retention stays bounded to the latest four even when scans are evicted',async()=>{
+ const h=harness(),ids=[]
+ try{
+  for(let i=0;i<5;i++){
+   const node=user(500+i,'Another completed task '+i)
+   h.nodes.splice(h.nodes.length-1,0,node);h.session.surface.nodes=h.nodes.map(n=>n.seq)
+   const view=await h.run({action:'inspect'});ids.push(view.scanId)
+   assert.equal((await h.run({scanId:view.scanId,ranges:[{startSeq:node.seq,endSeq:node.seq,summary:'Completed task '+i}]})).status,'compacted')
+  }
+  assert.equal((await h.run({scanId:ids[0]})).status,'needs_selection')
+  for(const scanId of ids.slice(1))assert.equal((await h.run({scanId})).status,'already_compacted')
+  assert.equal(h.attempts,5);assert.equal(h.archives,5)
  }finally{h.dispose()}
 })
 test('optional focused inspections do not evict the original batch scan',async()=>{

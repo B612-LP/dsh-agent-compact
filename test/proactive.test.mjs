@@ -162,7 +162,7 @@ function harness() {
 
 test('same-assembly registered context has an absolute threshold, even without model metadata', async () => {
   const h = harness()
-  assert.match(h.text(), /v0.3.0\/pressure/)
+  assert.match(h.text(), /v0.3.1\/pressure/)
   assert.match(h.text(), /maintenance at 350k/)
   const assembly = await h.prepare()
   assert.equal(assembly.contexts[0].text, 'preserve me')
@@ -202,7 +202,7 @@ test('route switch re-evaluates absolute occupancy but never reuses old metadata
   h.setNow(300000)
   assert.equal(h.text(), '')
   h.setNow(350000)
-  assert.match(h.text(), /v0.3.0\/pressure/)
+  assert.match(h.text(), /v0.3.1\/pressure/)
   assert.doesNotMatch(h.text(), /[Oo]fficial fallback limit/)
   h.services.llm = { resolveModelInfo: async () => ({ context: { contextWindow: 1000000 }, defaultMaxTokens: 32768 }) }
   await h.prepare()
@@ -215,7 +215,7 @@ test('metadata lookup failure does not block the assembly or absolute 350k maint
   h.services.llm = { resolveModelInfo: async () => { throw new Error('offline metadata') } }
   const assembly = await h.prepare()
   assert.equal(assembly.contexts[0].text, 'preserve me')
-  assert.match(assembly.contexts[1].text, /v0.3.0\/pressure/)
+  assert.match(assembly.contexts[1].text, /v0.3.1\/pressure/)
   assert.doesNotMatch(h.text(), /[Oo]fficial fallback limit/)
 })
 
@@ -230,7 +230,7 @@ test('two presets with identical route names retain independent LLM metadata', a
   for (const agent of [a, b, a, b, a]) {
     h.setAgent(agent)
     const assembly = await h.prepare()
-    assert.match(assembly.contexts[1].text, agent === a ? /v0.3.0\/urgent/ : /v0.3.0\/pressure/)
+    assert.match(assembly.contexts[1].text, agent === a ? /v0.3.1\/urgent/ : /v0.3.1\/pressure/)
     assert.match(assembly.contexts[1].text, agent === a ? /limit ~400k/ : /limit ~800k/)
   }
 })
@@ -244,7 +244,7 @@ test('expired metadata outage retains matching cached safety budget', async () =
   h.services.llm.resolveModelInfo = async () => { throw new Error('temporary outage') }
   try {
     assert.match((await h.prepare()).contexts[1].text, /[Oo]fficial fallback limit ~400k/)
-    assert.match(h.text(), /v0.3.0\/urgent/)
+    assert.match(h.text(), /v0.3.1\/urgent/)
   } finally { Date.now = originalNow }
 })
 
@@ -252,7 +252,7 @@ test('broken optional projection cannot hide a working meter', async () => {
   const h = harness()
   h.services.sessionProjections.snapshot = () => { throw new Error('broken projection') }
   await h.prepare()
-  assert.match(h.text(), /v0.3.0\/urgent/)
+  assert.match(h.text(), /v0.3.1\/urgent/)
 })
 
 test('real Cordis + SystemPrompt includes same-assembly and admission hints with runtime context disabled', async () => {
@@ -269,7 +269,7 @@ test('real Cordis + SystemPrompt includes same-assembly and admission hints with
   try {
     const assembly = await prompt.assemble({})
     const hint = assembly.contexts.find(c => c.name === 'agent-compact:volume-nudge')
-    assert.match(hint.text, /v0.3.0\/urgent/)
+    assert.match(hint.text, /v0.3.1\/urgent/)
     assert.match(hint.text, /maintenance at 350k/)
     assert.match(hint.text, /[Oo]fficial fallback limit ~400k/)
     const refreshed = prompt.refreshContext(assembly, {})
@@ -286,6 +286,17 @@ test('guidance protects detail and active spans without vetoing unrelated finish
   assert.doesNotMatch(COMPACTION_GUIDANCE, /one concluded sub-task per call|Tiny\/low-net-benefit spans are intentionally skipped/)
   assert.match(COMPACTION_GUIDANCE, /absolute token occupancy/)
   assert.doesNotMatch(COMPACTION_GUIDANCE, /evaluate only when a nudge appears/)
+})
+
+test('guidance minimizes end-to-end drafting work without losing continuation-critical detail', () => {
+  assert.match(COMPACTION_GUIDANCE, /end-to-end maintenance work/)
+  assert.match(COMPACTION_GUIDANCE, /inspection, reasoning, drafting and retries/)
+  assert.match(COMPACTION_GUIDANCE, /current continuation state once, not an exhaustive release history or transcript chronology/)
+  assert.match(COMPACTION_GUIDANCE, /Consolidate repeated summaries, superseded attempts and obsolete log IDs/)
+  assert.match(COMPACTION_GUIDANCE, /still-needed dependencies, exact paths\/commands\/IDs/)
+  assert.match(COMPACTION_GUIDANCE, /reuse unchanged summaries on safe retries/)
+  assert.match(COMPACTION_GUIDANCE, /never replace continuation-critical details/)
+  assert.match(COMPACTION_GUIDANCE, /no arbitrary word, token or time cap/)
 })
 
 test('assembly upgrades stale sid summary caches before official fallback even without a tool call', async () => {
