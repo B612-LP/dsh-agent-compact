@@ -15,7 +15,7 @@ import { patchEngine } from './optimizer.js'
 import { normText } from './normalize.js'
 import { CtxSurfaceService } from './ctx-surface.js'
 import { resolveBoundaries, soleToolCall, spanText } from './boundary.js'
-import { occupancyFromMeasurement, pressureRowFieldsOf, projectedPressureFromRow } from './occupancy.js'
+import { registerProactiveCompaction } from './proactive.js'
 import type { AgentLike, OptimizedEngineLike, SessionLike, SurfaceNode } from './optimizer.js'
 
 export const name = 'tool-context-compression'
@@ -25,11 +25,15 @@ export const inject = ['tools', 'systemPrompt']
 export interface Config {
   autoArchive: boolean
   volumeNudgeTokens: number
+  pressureStartRatio: number
+  pressureTargetRatio: number
 }
 
 export const Config: Schema<Config> = Schema.object({
   autoArchive: Schema.boolean().default(true).description('context_compact saves the full raw span to a spill artifact before replacing it.'),
-  volumeNudgeTokens: Schema.number().default(300000).description('Nudge ladder over growth in request pressure since the last compaction, measured provider-usage-anchored when available (falls back to the heuristic surface estimate): one-time nudges at 5/6× and 1× of this amount, then a persistent every-turn reminder from 4/3× onward until a compaction resets the baseline. Example 300000: one-time at 250k and 300k, persistent from 400k. Set to 0 to disable.'),
+  volumeNudgeTokens: Schema.number().min(0).default(300000).description('Secondary growth safeguard: persistent maintenance starts at 5/6 of this growth since the last compaction. 0 disables only the growth safeguard; absolute-pressure maintenance remains active.'),
+  pressureStartRatio: Schema.number().min(0.1).max(0.9).default(0.6).description('Start persistent proactive maintenance at this fraction of the routed official auto-compaction threshold, including output reservation and headroom. Not a fraction of the raw context window.'),
+  pressureTargetRatio: Schema.number().min(0.05).max(0.8).default(0.5).description('Keep pressure maintenance active until below this fraction of the official threshold. Clamped below pressureStartRatio to preserve hysteresis. Required details and in-flight work always take priority over this target.'),
 })
 
 export function apply(ctx: Context, config: Config) {
@@ -86,60 +90,6 @@ export function apply(ctx: Context, config: Config) {
     seq?: number
     data?: unknown
     sourceEventSeqs?: unknown
-  }
-
-  // 用会话占用量的增长量作为提醒信号：自上次压缩以来增长跨过
-  // config.volumeNudgeTokens 的 5/6、1 倍档各提醒一次，4/3 倍起每轮持续提醒。
-  // 度量指标按优先级（按 provider 锚定程度排序）：
-  //  1. tokenMeter.measure().totalTokens —— 官方服务以最近一次成功调用的
-  //     provider 真实 usage 为锚、对表面增量重定价后的当前请求压力；CJK 与
-  //     JSON 不会被 chars/4 启发式低估；
-  //  2. tokenMeter.measure().surfaceTokens —— 同一次测量的启发式表面值；
-  //  3. sessionProjections 的 contextPressure 行 —— 兼容 { ver, seq, val }
-  //     包装，按官方 view() 公式现算（pressureTokens + surface −
-  //     sampledSurface），无采样锚时退回 pressureTokens；仅当 tokenMeter
-  //     服务缺席时使用。
-  // 全部缺席时整个特性降级为 no-op。
-  const volumeBaseline = new WeakMap<SessionLike, number>()
-  // 已触发过的一次性提醒档位（每会话）；压缩重置基线时一并清空。
-  const firedOneShots = new WeakMap<SessionLike, Set<number>>()
-
-  interface TokenMeterLike {
-    measure(session: SessionLike): { surfaceTokens?: unknown; totalTokens?: unknown } | null | undefined
-  }
-
-  interface SessionProjectionsLike {
-    snapshot(session: SessionLike): { values?: Record<string, unknown> } | null | undefined
-  }
-
-  function tokenMeterMeasureOf(session: SessionLike): { surfaceTokens?: unknown; totalTokens?: unknown } | null {
-    const meter = ctx.get('tokenMeter') as TokenMeterLike | undefined
-    if (!meter || typeof meter.measure !== 'function') return null
-    try {
-      const m = meter.measure(session) as { surfaceTokens?: unknown; totalTokens?: unknown } | null | undefined
-      return m && typeof m === 'object' ? m : null
-    } catch (e) {
-      return null
-    }
-  }
-
-  function contextPressureProjectedTokensOf(session: SessionLike): number | null {
-    const projections = ctx.get('sessionProjections') as SessionProjectionsLike | undefined
-    if (!projections || typeof projections.snapshot !== 'function') return null
-    try {
-      const snap = projections.snapshot(session)
-      const values = snap && snap.values
-      if (!values || typeof values !== 'object') return null
-      return projectedPressureFromRow(pressureRowFieldsOf((values as Record<string, unknown>).contextPressure))
-    } catch (e) {
-      return null
-    }
-  }
-
-  function occupancyTokensOf(session: SessionLike): number | null {
-    const fromMeter = occupancyFromMeasurement(tokenMeterMeasureOf(session))
-    if (fromMeter !== null) return fromMeter
-    return contextPressureProjectedTokensOf(session)
   }
 
   function resolveService(agent: AgentLike, serviceName: string): unknown {
@@ -243,72 +193,7 @@ export function apply(ctx: Context, config: Config) {
 
   const disposers: (() => void)[] = []
 
-  // `context_compact` 的主机级 system-prompt 指引（order 118，全局提示层）。
-  const systemPrompt = ctx.get('systemPrompt')
-  if (systemPrompt) {
-    disposers.push(systemPrompt.section({
-      name: 'tool:context_compact',
-      order: 118,
-      text: 'Use the context_compact tool to externalize conversation spans that have fully served their purpose — but do not compress proactively between volume nudges: evaluate only when a nudge appears or the user asks. A wrong compression costs more working quality than the tokens it saves. Compress only a span that satisfies ALL of: (a) its sub-task is fully concluded; (b) a summary fully covers its information for the rest of the conversation; (c) it is not part of a high-risk operation still in progress (deploys, migrations, long-running jobs) — never compress those until they finish. Keep each compression to ONE concluded sub-task; a large multi-milestone effort is compressed per milestone, never as one giant span. If verbatim detail may still be quoted later (error text, file contents, exact numbers), leave the span. Never compress the opening, the in-flight task, or the active instruction; preserve exact paths, commands, IDs, the user\'s requirements, and every user correction verbatim in the checkpoint.',
-    }))
-  }
-
-  // 会话发生压缩（含自动引擎）时重置增长基线。
-  disposers.push(ctx.on('session/event', (session: SessionLike | undefined, event: SessionEventLike) => {
-    try {
-      if (!session || event.type !== 'compaction/summary') return
-      const tokens = occupancyTokensOf(session)
-      volumeBaseline.set(session, tokens ?? 0)
-      firedOneShots.delete(session)
-    } catch (e) {
-      /* 忽略 */
-    }
-  }))
-
-  // 通过 systemPrompt.context() 注入尾部实时提示：仅在增长跨过整数倍的那几步
-  // 写入 KV 缓存（文本不变时是完全的 no-op），独立于自动引擎的压力阈值。
-  if (systemPrompt) {
-    disposers.push(systemPrompt.context({
-      name: 'agent-compact:volume-nudge',
-      order: 50,
-      text: () => {
-        try {
-          const threshold = config.volumeNudgeTokens
-          if (!(threshold > 0)) return ''
-          const agentsService = ctx.get('agents')
-          const current = agentsService && typeof (agentsService as { currentInitiator?: unknown }).currentInitiator === 'function'
-            ? (agentsService as { currentInitiator: () => unknown }).currentInitiator()
-            : undefined
-          const agent = current as { session?: SessionLike } | undefined
-          if (!agent || !agent.session) return ''
-          const now = occupancyTokensOf(agent.session)
-          if (now === null) return ''
-          const baseline = volumeBaseline.get(agent.session) ?? 0
-          const grown = now - baseline
-          if (grown <= 0) return ''
-          // 阶梯提醒（随阈值缩放）：5/6 处一次性、1× 处一次性、4/3 起持续。
-          // 默认 30 万 → 25 万一次、30 万一次、40 万起每轮都在。
-          const build = (approxK: number, recurring: boolean) =>
-            '`context_compact` reminder: this session\'s surface has grown by roughly ' + approxK + 'k+ tokens since the last compaction (tool results AND your own reasoning/output both count).' + (recurring ? ' This reminder repeats every turn until a compaction resets it.' : ' One-time nudge.') + ' A nudge is a trigger to evaluate, never an instruction to compact: compact only at the right place — a fully concluded sub-task\'s span, compressed in chunks with `context_compact`; skip it while anything is still in flight or its verbatim detail may still be needed.'
-          const persistentFrom = Math.floor((threshold * 4) / 3)
-          if (grown >= persistentFrom) {
-            return build(Math.round(grown / 1000), true)
-          }
-          const fired = firedOneShots.get(agent.session) ?? new Set<number>()
-          for (const tier of [Math.floor((threshold * 5) / 6), threshold]) {
-            if (grown >= tier && !fired.has(tier)) {
-              fired.add(tier)
-              firedOneShots.set(agent.session, fired)
-              return build(Math.round(tier / 1000), false)
-            }
-          }
-          return ''
-        } catch (e) {
-          return ''
-        }
-      },
-    }))
-  }
+  disposers.push(registerProactiveCompaction(ctx, config))
 
   disposers.push(tools.register(defineTool({
     name: 'context_compact',
@@ -433,7 +318,7 @@ export function apply(ctx: Context, config: Config) {
                   })
                   // 复用该占位槽位作为自我触发的习惯提醒：每次成功调用都给
                   // 下一次留下提示，引导模型自主管理上下文。
-                  session.append('user/message', createShadowUserMessage('`context_compact` result shadowed. Stay conservative: compact only fully concluded sub-task spans, never anything in flight; when in doubt, keep the context as is.'), {
+                  session.append('user/message', createShadowUserMessage('`context_compact` result shadowed. Re-check pressure: if proactive maintenance remains active, checkpoint another substantial, fully concluded sub-task; a small reduction is not enough while still high. Preserve exact requirements/corrections and necessary details. Keep in-flight spans intact; unrelated running jobs do not block other finished spans. If no safe useful span exists, retain it and explain why.'), {
                     surfaceOp: { op: 'replace', startSeq: resultSeq, endSeq: resultSeq },
                     sourceEventSeqs: [resultSeq],
                   })
