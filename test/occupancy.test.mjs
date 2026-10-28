@@ -51,7 +51,7 @@ test('pressureRowFieldsOf tolerates null/undefined rows and missing fields', () 
 
 test('projectedPressureFromRow recomputes the official view formula from the real regression case', () => {
   // 真实长会话（CJK+JSON 密集）的投影：chars/4 表面值 23.4 万，provider
-  // 真实压力 37.6 万——修复前 nudge 因此从未触发。
+  // provider prompt 37.6 万；raw cache 不含展示层现算的 projectedTokens。
   const fields = pressureRowFieldsOf({
     ver: 5,
     seq: 7171,

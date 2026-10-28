@@ -51,9 +51,8 @@ dsh plugin --profile web remove @mimichunterz/agent-compact
 | 字段 | 默认 | 说明 |
 |---|---|---|
 | `autoArchive` | `true` | `context_compact` 在替换区间前先把原始区间全文存到 spill 归档 |
-| `volumeNudgeTokens` | `300000` | 增长兜底：自上次压缩增长达到该值的 5/6 后持续提醒；`0` 仅关闭此兜底，不关闭绝对压力维护。 |
-| `pressureStartRatio` | `0.6` | 在官方自动压缩实际触发线的此比例开始持续维护，不是窗口容量比例。 |
-| `pressureTargetRatio` | `0.5` | 压至官方触发线的此比例以下才解除（限制为低于开始线）；必要细节优先于数字目标。 |
+| `volumeNudgeTokens` | `300000` | 绝对当前占用：5/6（25万）开始提醒，达到此值（30万）持续维护，持续状态降至25万以下解除。50万/100万窗口一致，不是距上次压缩的增长量。`0` 关闭主档位。 |
+| `autoSafetyMarginTokens` | `65536` | 补充防溢出：在官方实际线之前留此token余量，小模型自动限制此余量；不改变25万/30万主规则。 |
 
 通过 profile 的 `cordis.patch.yml` 或 bundle patch 插入行来配置。
 
@@ -61,7 +60,8 @@ dsh plugin --profile web remove @mimichunterz/agent-compact
 
 - **agent 自写检查点**:`summary` 是强制参数,工具路径总是走 agent 写的检查点。`patchEngine()`(见 `src/optimizer.ts`)包装引擎的 `summarize()` —— 存在 `_externalSummary`(按会话 id 一次性消费)时直接返回该文本;没有时才转发 stock 实现,该分支只服务于自动压缩路径,保持官方行为不变。
 - **系统提示词引导**:插件注册一个全局提示词 section(`tool:context_compact`,order 118),要求 agent **主动**调用 `context_compact` —— 在话题边界压缩已完成的步骤,而不是等自动全量压缩。
-- **压力驱动主动维护(v0.2.3)**:required 动态上下文(`agent-compact:volume-nudge`,order 50)使用与官方同源的 `tokenMeter.measure(session).totalTokens`。异步 assembly waterfall 按精确路由及 LLM 服务作用域预取模型信息，并在同一次组装返回前重新生成提示；注册的同步 provider 在请求准入时再次刷新。读取新压力和当前 agent 作用域内官方引擎的已解析配置。官方线为 `floor(min(C*thresholdRatio, C-请求输出预留-headroomTokens))`，包含模型覆盖规则。默认达官方线60%起持续、80%起紧急、压至50%以下解除；**小压缩不能消除仍然偏高的绝对压力提醒**。容量或元数据未知时不伪造阈值，保留增长兜底。切模型、重载后重新评估。
+- **绝对占用主动维护(v0.2.4)**:required 动态上下文(`agent-compact:volume-nudge`,order 50)使用与官方同源的 `tokenMeter.measure(session).totalTokens`。**25万开始提醒、30万起持续，降至25万以下解除持续状态**。50万/100万窗口都用相同档位，不用窗口百分比，也不是距上次压缩的增长量。压缩事件不清零当前占用，压完仍偏满就继续；模型元数据不可用也不影响主规则。
+- **补充防溢出**:异步 assembly waterfall 按精确路由及 LLM 服务作用域预取元数据，同一组装返回前重算提示，同步 provider 用于准入刷新。官方线为 `floor(min(C*thresholdRatio, C-请求输出预留-headroomTokens))`，包含模型覆盖；在此线前留绝对token余量作额外保护（仅小模型限制余量上限为官方预算1/4），不改变25万/30万主规则。未知时不猜容量。
 - **保护必要信息**:自然边界主动整理已收尾子任务，每次一个，仍偏满就继续；保留要求/纠正原话、路径/ID、决策、证据、风险及下一步。不动在飞区间；无关后台任务不妨碍压缩其他已结束区间。没有安全有益的跨度时保留并说明原因，不为数字目标强行丢信息。
 - **官方只作应急兜底**:不关闭、不拦截、不延迟官方自动压缩。提示无法保证模型必定执行，单次巨大输入/工具返回也可能一步跨过提前维护区，因此不承诺官方压缩永不触发。维护模式变化会记录版本、会话ID、压力、官方线和目标，不记录对话正文。
 - **锚点定位**(`src/normalize.ts`):`normText` 折叠空白并把 CJK 全角标点映射为半角(，→, 等),锚点与节点文本共用同一函数;仍保持**唯一前缀**语义(0 命中 → not found + 最近节点提示;多命中 → AMBIGUOUS)。

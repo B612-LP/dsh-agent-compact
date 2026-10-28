@@ -3,9 +3,9 @@
 // token 数。供 index.ts 的 nudge 基线与增长测量使用；全部输入缺失时返回
 // null，由调用方把整个特性降级为 no-op。
 //
-// 背景：nudge 曾经只认 chars/4 启发式的 surfaceTokens，对 CJK 与 JSON 密集
-// 的会话系统性低估（token-meter 自己的文档承认这一点），长会话会涨到真实
-// 压力 75% 仍一次提醒都不发。因此这里优先取 provider 真实 usage 锚定的值。
+// chars/4 的 surfaceTokens 会低估 CJK 与 JSON 密集的会话，因此优先取
+// tokenMeter 的 usage 锚定估算。snapshot.values 是 wire view，可有
+// projectedTokens；持久化 cache 的原始 {ver,seq,val} 行不等于该 API。
 
 export interface TokenMeasurementLike {
   /** 官方测量的当前请求压力：provider usage 锚 + 表面增量重定价。 */

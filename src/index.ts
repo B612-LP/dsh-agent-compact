@@ -25,15 +25,13 @@ export const inject = ['tools', 'systemPrompt']
 export interface Config {
   autoArchive: boolean
   volumeNudgeTokens: number
-  pressureStartRatio: number
-  pressureTargetRatio: number
+  autoSafetyMarginTokens: number
 }
 
 export const Config: Schema<Config> = Schema.object({
   autoArchive: Schema.boolean().default(true).description('context_compact saves the full raw span to a spill artifact before replacing it.'),
-  volumeNudgeTokens: Schema.number().min(0).default(300000).description('Secondary growth safeguard: persistent maintenance starts at 5/6 of this growth since the last compaction. 0 disables only the growth safeguard; absolute-pressure maintenance remains active.'),
-  pressureStartRatio: Schema.number().min(0.1).max(0.9).default(0.6).description('Start persistent proactive maintenance at this fraction of the routed official auto-compaction threshold, including output reservation and headroom. Not a fraction of the raw context window.'),
-  pressureTargetRatio: Schema.number().min(0.05).max(0.8).default(0.5).description('Keep pressure maintenance active until below this fraction of the official threshold. Clamped below pressureStartRatio to preserve hysteresis. Required details and in-flight work always take priority over this target.'),
+  volumeNudgeTokens: Schema.number().min(0).default(300000).description('Absolute current-occupancy bands: notice from 5/6 of this amount (default 250k), continuous maintenance from this amount (300k). Once continuous, keep prompting until below the notice band. Not growth since compaction or a percentage of context capacity. 0 disables these quality bands.'),
+  autoSafetyMarginTokens: Schema.number().min(0).default(65536).description('Secondary overflow guard: also warn this many tokens before the routed official auto-compaction threshold; capped for very small models. Does not scale or postpone the absolute 250k/300k quality bands.'),
 })
 
 export function apply(ctx: Context, config: Config) {

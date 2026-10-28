@@ -5,8 +5,7 @@ import { occupancyFromMeasurement, pressureRowFieldsOf, projectedPressureFromRow
 
 export interface ProactiveConfig {
   volumeNudgeTokens: number
-  pressureStartRatio: number
-  pressureTargetRatio: number
+  autoSafetyMarginTokens: number
 }
 
 type RecordLike = Record<string, unknown>
@@ -27,9 +26,8 @@ function ratio(value: unknown, fallback: number): number {
 
 export interface AutomaticBudget {
   threshold: number
-  start: number
-  target: number
   urgent: number
+  safetyTarget: number
 }
 
 // Match BasicCompactionEngine's ratio AND output/headroom cap, including exact-route
@@ -56,33 +54,33 @@ export function automaticBudget(
   if (!Number.isInteger(completion) || !Number.isInteger(headroom)) return null
   const threshold = Math.floor(Math.min(window * thresholdRatio, window - completion - headroom))
   if (threshold <= 0) return null
-  const startRatio = ratio(config.pressureStartRatio, 0.6)
-  const targetRatio = Math.min(ratio(config.pressureTargetRatio, 0.5), startRatio * 0.9)
-  return {
-    threshold,
-    start: Math.floor(threshold * startRatio),
-    target: Math.floor(threshold * targetRatio),
-    urgent: Math.floor(threshold * 0.8),
-  }
+  // Secondary overflow guard ONLY. Cap an absolute margin for very small models;
+  // this does not scale the primary 250k/300k context-quality bands with capacity.
+  const margin = Math.min(nonnegative(config.autoSafetyMarginTokens) ?? 65536, Math.floor(threshold / 4))
+  return { threshold, urgent: threshold - margin, safetyTarget: threshold - Math.ceil(margin * 1.5) }
 }
 
 export interface NudgeState {
-  baseline: number
-  growthActive: boolean
   pressureActive: boolean
+  safetyActive: boolean
 }
-export function evaluateNudge(now: number, budget: AutomaticBudget | null, state: NudgeState, growthThreshold: number) {
+export function evaluateNudge(now: number, budget: AutomaticBudget | null, state: NudgeState, threshold: number) {
+  const warning = Math.floor(threshold * 5 / 6)
+  if (threshold > 0) {
+    if (now < warning) state.pressureActive = false
+    else if (now >= threshold) state.pressureActive = true
+  } else state.pressureActive = false
+  // Missing metadata cannot mark a previously unsafe SAME-route budget healthy.
   if (budget) {
-    if (now <= budget.target) state.pressureActive = false
-    else if (now >= budget.start) state.pressureActive = true
+    if (now < budget.safetyTarget) state.safetyActive = false
+    else if (now >= budget.urgent) state.safetyActive = true
   }
-  // A temporary metadata outage must not clear a still-active maintenance cycle.
-  if (growthThreshold > 0 && now - state.baseline >= Math.floor(growthThreshold * 5 / 6)) state.growthActive = true
-  if (state.pressureActive) return budget && now >= budget.urgent ? 'urgent' : 'pressure'
-  return state.growthActive ? 'growth' : 'quiet'
+  if (state.safetyActive) return 'urgent'
+  if (state.pressureActive) return 'pressure'
+  return threshold > 0 && now >= warning ? 'notice' : 'quiet'
 }
 
-export const COMPACTION_GUIDANCE = 'Keep context healthy with agent-written context_compact checkpoints instead of waiting for automatic full-history summarization. Proactively compact substantial, fully concluded sub-task spans at safe topic boundaries; a pressure reminder means prioritize this before optional new work. Each checkpoint must preserve current requirements and user corrections verbatim, exact paths/commands/IDs, decisions and rationale, verified results, unresolved risks, and the next steps needed to continue. Keep the opening requirements, active instruction, recent working context, and in-flight deployment/migration/job spans live. An unrelated background task is NOT a reason to leave other fully concluded spans uncompressed. Compact one concluded sub-task per call, then re-check pressure and continue with other eligible spans until healthy; one small compaction is not enough if pressure remains high. Use exact unique message prefixes for anchors; after an anchor error re-read the surviving surface, do not repeat guessed anchors. Never compress for token savings at the cost of necessary detail; when no safe useful span exists, retain it, say why, and avoid optional bulk output. The official engine remains an emergency fallback, not the normal context-management strategy.'
+export const COMPACTION_GUIDANCE = 'Keep context healthy with agent-written context_compact checkpoints instead of waiting for automatic full-history summarization. Manage current absolute token occupancy, not percentage of a 500k/1M window or growth since the last compaction: follow the configured notice/continuous bands (defaults 250k/300k). Proactively compact substantial, fully concluded sub-task spans at safe topic boundaries; a pressure reminder means prioritize this before optional new work. Each checkpoint must preserve current requirements and user corrections verbatim, exact paths/commands/IDs, decisions and rationale, verified results, unresolved risks, and the next steps needed to continue. Keep the opening requirements, active instruction, recent working context, and in-flight deployment/migration/job spans live. An unrelated background task is NOT a reason to leave other fully concluded spans uncompressed. Compact one concluded sub-task per call, then re-check pressure and continue with other eligible spans until healthy; one small compaction is not enough if pressure remains high. Use exact unique message prefixes for anchors; after an anchor error re-read the surviving surface, do not repeat guessed anchors. Never compress for token savings at the cost of necessary detail; when no safe useful span exists, retain it, say why, and avoid optional bulk output. The official engine remains an emergency fallback, not the normal context-management strategy.'
 
 interface Host {
   get(name: string): any
@@ -91,7 +89,6 @@ interface Host {
 }
 export function registerProactiveCompaction(ctx: Host, config: ProactiveConfig): () => void {
   const states = new WeakMap<SessionLike, NudgeState & { routeKey?: string; llm?: unknown }>()
-  const resetPending = new WeakSet<SessionLike>()
   const modes = new WeakMap<SessionLike, string>()
   const modelInfos = new WeakMap<object, Map<string, { info: unknown; until: number }>>()
   function cacheFor(llm: unknown) {
@@ -139,9 +136,8 @@ export function registerProactiveCompaction(ctx: Host, config: ProactiveConfig):
       ctx.logger.warn('[context_compact] model budget lookup unavailable: %s', String(error))
     }
   }
-  disposers.push(ctx.on('session/event', (session: SessionLike, event: { type?: string }) => {
-    if (session && event.type === 'compaction/summary') resetPending.add(session)
-  }))
+  // No compaction/summary reset: thresholds describe CURRENT absolute occupancy,
+  // not growth since the previous checkpoint. Small reductions must stay visible.
   const systemPrompt = ctx.get('systemPrompt')
   if (systemPrompt) {
     disposers.push(systemPrompt.section({ name: 'tool:context_compact', order: 118, text: COMPACTION_GUIDANCE }))
@@ -162,17 +158,11 @@ export function registerProactiveCompaction(ctx: Host, config: ProactiveConfig):
           }
           if (now === null) return ''
           const state: NudgeState & { routeKey?: string; llm?: unknown } = states.get(session)
-            ?? { baseline: 0, growthActive: false, pressureActive: false }
-          if (resetPending.has(session)) {
-            state.baseline = now
-            state.growthActive = false
-            resetPending.delete(session)
-            // Deliberately keep pressureActive: an inadequate reduction must not silence it.
-          }
+            ?? { pressureActive: false, safetyActive: false }
           const request = requestOf(agent)
           const key = modelKey(request)
           const llm = service(agent, 'llm')
-          if (state.routeKey !== key || state.llm !== llm) state.pressureActive = false
+          if (state.routeKey !== key || state.llm !== llm) state.safetyActive = false
           state.routeKey = key
           state.llm = llm
           // Keep last known SAME-service/SAME-route metadata during an outage.
@@ -182,13 +172,14 @@ export function registerProactiveCompaction(ctx: Host, config: ProactiveConfig):
           const mode = evaluateNudge(now, budget, state, config.volumeNudgeTokens)
           states.set(session, state)
           if (modes.get(session) !== mode) {
-            ctx.logger.info('[context_compact] proactive v0.2.3 session=%s mode=%s pressure=%d limit=%s target=%s',
-              session.id, mode, Math.round(now), budget?.threshold ?? 'unknown', budget?.target ?? 'unknown')
+            ctx.logger.info('[context_compact] proactive v0.2.4 session=%s mode=%s pressure=%d limit=%s warning=%d continuous=%d',
+              session.id, mode, Math.round(now), budget?.threshold ?? 'unknown', Math.floor(config.volumeNudgeTokens * 5 / 6), config.volumeNudgeTokens)
             modes.set(session, mode)
           }
           if (mode === 'quiet') return ''
-          const pressure = budget ? ` Current request pressure ~${Math.ceil(now / 1000)}k tokens; official fallback limit ~${Math.floor(budget.threshold / 1000)}k; healthy target <=${Math.floor(budget.target / 1000)}k.` : ' Model budget unavailable; keep the existing maintenance/growth safeguard active without guessing a safe capacity.'
-          return '`context_compact` proactive maintenance [v0.2.3/' + mode + '].' + pressure
+          const bands = ` Current request pressure ~${Math.ceil(now / 1000)}k tokens. Absolute context-quality bands: notice at ${Math.floor(config.volumeNudgeTokens * 5 / 6000)}k, continuous maintenance at ${Math.floor(config.volumeNudgeTokens / 1000)}k; aim below the notice band when safe. These bands do not increase for a larger context window.`
+          const safety = budget ? ` Official fallback limit ~${Math.floor(budget.threshold / 1000)}k (secondary overflow protection only).` : ' Official fallback budget unavailable; the absolute bands above still apply.'
+          return '`context_compact` proactive maintenance [v0.2.4/' + mode + '].' + bands + safety
             + (budget && now >= budget.threshold ? ' The official fallback line has been reached; the host may already invoke emergency summarization. Do not assume another model step is guaranteed.'
               : mode === 'urgent' ? ' URGENT: create a safe checkpoint before optional new tools or large outputs; automatic full-history summarization is approaching.'
               : ' At the next safe boundary, prioritize checkpointing already-concluded sub-tasks before starting optional new work.')
